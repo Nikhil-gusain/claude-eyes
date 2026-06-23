@@ -1,0 +1,42 @@
+# AI Browser Controller — Python dependencies
+#
+# Install ONLY inside a virtualenv (never globally):
+#     python3.12 -m venv venv
+#     source venv/bin/activate          # macOS/Linux
+#     venv\Scripts\activate             # Windows
+#     pip install -r requirements.txt
+#
+# AFTER pip install, download the browser binaries (required, one-time):
+#     playwright install chromium
+#
+# SYSTEM dependency (NOT a pip package): ffmpeg must be installed separately and
+# be on your PATH for screen recording / MP4 encoding to work. Install it with:
+#     macOS:        brew install ffmpeg
+#     Debian/Ubuntu: sudo apt install ffmpeg
+#     Windows:      download from https://www.gyan.dev/ffmpeg/builds/ (or `winget install ffmpeg`)
+
+# ----- core -----
+pydantic>=2.6            # v2 — settings/command/response models
+
+# ----- browser -----
+playwright>=1.42         # browser automation engine (run `playwright install chromium`)
+
+# ----- api -----
+fastapi>=0.110           # HTTP + WebSocket server surface
+uvicorn[standard]>=0.29  # ASGI server (standard extras: websockets, httptools, uvloop)
+websockets>=12.0         # WebSocket client/server protocol
+
+# ----- vision -----
+opencv-python>=4.9       # frame processing / video assembly helpers
+pillow>=10.2             # image loading, annotation, resizing
+numpy>=1.26              # array math backing the vision pipeline
+
+# ----- ai -----
+mcp>=1.2                 # Model Context Protocol stdio server (FastMCP)
+anthropic>=0.45          # Claude adapter (default model: claude-opus-4-8)
+openai>=1.30             # OpenAI adapter
+
+# ----- test -----
+pytest>=8.0              # test runner
+pytest-asyncio>=0.23     # async test support (asyncio_mode=auto, see pyproject.toml)
+httpx>=0.27              # async HTTP client used by FastAPI TestClient and tests

@@ -1,0 +1,9 @@
+[project]
+name = "ai-browser-controller"
+version = "0.1.0"
+description = "Plug-and-play browser automation that lets any AI agent (primarily Claude) drive a real browser — navigate, inspect, screenshot, record, and report structured results."
+requires-python = ">=3.12"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

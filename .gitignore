@@ -1,0 +1,75 @@
+# ===========================================================================
+# AI Browser Controller — .gitignore
+# ===========================================================================
+
+# --- Virtual environments --------------------------------------------------
+venv/
+.venv/
+env/
+ENV/
+
+# --- Python bytecode / caches / build artifacts ----------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+.eggs/
+build/
+dist/
+.coverage
+htmlcov/
+
+# --- Environment / secrets -------------------------------------------------
+# Never commit real credentials. .env.example IS committed as a template.
+.env
+.env.*
+!.env.example
+
+# --- Stored media: ignore CONTENTS but keep the folders via .gitkeep -------
+app/storage/screenshots/*
+app/storage/recordings/*
+app/storage/downloads/
+!app/storage/screenshots/.gitkeep
+!app/storage/recordings/.gitkeep
+
+# --- Persistent browser profile: cookies/tokens/logins — NEVER commit -------
+app/storage/browser_profile/
+
+# --- Generated captures / reports at the project root ----------------------
+# Screenshots, videos, and JSON dumps produced by runs or demo scripts.
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+*.mp4
+*.webm
+*.mkv
+*.avi
+admin_*.json
+*_report.json
+fun_fact*.*
+admin_*.*
+
+# --- Internal / working docs (NOT pushed to the public repo) ---------------
+# README.md is intentionally kept and committed.
+TASKS.md
+NOTES.md
+TODO.md
+SCRATCH.md
+*.local.md
+
+# --- Logs ------------------------------------------------------------------
+*.log
+logs/
+
+# --- Editor / IDE / OS cruft -----------------------------------------------
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
