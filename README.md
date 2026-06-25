@@ -5,6 +5,11 @@ A plug-and-play browser automation layer that lets any AI agent — primarily **
 ## Features
 
 - **Full browser control** — launch/close, navigate (back/forward/refresh), tabs, click/double-click/right-click, hover, fill inputs, scroll, press keys, upload/download files, and waits — backed by Playwright.
+- **Humanized interaction (anti bot-detection)** — on by default: typing is paced (~25 WPM with natural jitter), the mouse travels a curved, wobbling path to a random point inside the target (never a straight teleport to the exact center) and remembers where it was, and scrolling is lazy/incremental like a human discovering the page. Force on/off per call with `humanize`, or globally with `ABC_HUMANIZE`. Optionally drive real Chrome via `ABC_BROWSER_CHANNEL=chrome`.
+- **Multiple Chrome profiles** — named, isolated profiles (each its own logins/cookies). The chosen profile is **remembered on disk and auto-reopens in later chats**; `open_browser` asks which profile to use (or random) the first time. Tools: `list_profiles`, `select_profile`, `create_profile`, and `login_session` (opens a headed window so a human can log in / sign up, then saves the session for future automated runs).
+- **Event-driven waiting** — wait *quietly* for slow things instead of polling: `wait_for_stable` resolves when an element's text stops changing (perfect for an online AI's streamed answer), and `wait_for_response` resolves when a matching network response finishes streaming. Capped at 5 min by default (`ABC_MAX_WAIT_MS`); downloads get up to ~1h (`ABC_MAX_DOWNLOAD_WAIT_MS`). An SSE `/events` stream pushes progress to HTTP clients.
+- **Safe downloads** — `download_file` keeps **verified real images only** by default: the saved bytes are inspected (magic number + full decode) and anything that is actually an executable/app/archive disguised as an image is deleted and reported as an error.
+- **No-image mode (MarkItDown)** — a global toggle (`set_no_image_mode`) that suppresses pixel screenshots in favour of text, plus a `to_markdown` tool that converts images/PDF/Office/HTML (file or URL) to markdown via Microsoft's MarkItDown.
 - **Visual intelligence / screenshots** — capture the viewport, the full scrollable page, or a single element; optional annotation with a label.
 - **Screen recording to MP4** — record a browser session and finalize it to a video file (ffmpeg-backed).
 - **MCP server** — every action is published as an MCP tool over stdio, so Claude Desktop (and any MCP client) can drive the browser directly.
@@ -36,7 +41,10 @@ Module map:
 
 | Module | Responsibility |
 | --- | --- |
-| `app/browser/playwright_controller.py` | Thin async wrapper over Playwright (launch, navigate, interact, extract). |
+| `app/browser/playwright_controller.py` | Thin async wrapper over Playwright (launch, navigate, interact, extract). Routes typing/clicking/scrolling through the humanizer and tracks cursor position. |
+| `app/browser/humanize.py` | Human-like primitives: paced typing, curved/jittered mouse travel, lazy scroll. |
+| `app/browser/profiles.py` | `ProfileManager` — named profiles under `storage/profiles/` and the persisted active-profile pointer (`getProfileManager()` singleton). |
+| `app/browser/media.py` | `verifyImage` (download safety) and `toMarkdown` (MarkItDown, no-image mode). |
 | `app/browser/screenshot_manager.py` | Capture and save screenshots (viewport / full page / element / annotated). |
 | `app/browser/video_recorder.py` | Start/stop session recording and finalize the MP4 (ffmpeg). |
 | `app/browser/browser_manager.py` | **Facade** the API, MCP, and adapters all call. Wraps every action in the AI-friendly envelope and serializes access behind an `asyncio.Lock`. Exposes `getBrowserManager()` singleton. |
@@ -291,15 +299,23 @@ All runtime settings are resolved once at import time from `ABC_*` environment v
 | `ABC_HOST` | `apiHost` | `127.0.0.1` | Host/interface the FastAPI server binds to. |
 | `ABC_PORT` | `apiPort` | `8000` | Port the FastAPI server listens on. |
 | `ABC_BROWSER` | `browserType` | `chromium` | Browser engine: `chromium` \| `firefox` \| `webkit`. |
+| `ABC_BROWSER_CHANNEL` | `browserChannel` | _(bundled)_ | Real-browser channel, e.g. `chrome`, `msedge` (harder to bot-detect). |
 | `ABC_HEADLESS` | `headless` | `true` | Run without a visible window. |
 | `ABC_VIEWPORT_WIDTH` | `viewportWidth` | `1280` | Viewport width in pixels. |
 | `ABC_VIEWPORT_HEIGHT` | `viewportHeight` | `800` | Viewport height in pixels. |
 | `ABC_TIMEOUT_MS` | `defaultTimeoutMs` | `30000` | Default action/navigation timeout (ms). |
 | `ABC_USER_AGENT` | `userAgent` | _(browser default)_ | Optional custom User-Agent. |
+| `ABC_HUMANIZE` | `humanize` | `true` | Human-like typing/clicking/scrolling (anti bot-detection). |
+| `ABC_TYPING_WPM` | `typingWpm` | `25` | Typing speed in words/min (with jitter). |
+| `ABC_MAX_WAIT_MS` | `maxWaitMs` | `300000` | Ceiling for quiet/event-driven waits (5 min). |
+| `ABC_MAX_DOWNLOAD_WAIT_MS` | `maxDownloadWaitMs` | `3600000` | Ceiling for downloads (1 h). |
+| `ABC_NO_IMAGE_MODE` | `noImageMode` | `false` | Start in no-image mode (markdown over pixels). |
 | `ABC_RECORDING_FPS` | `recordingFps` | `24` | Frames per second for recordings. |
 | `ABC_FFMPEG` | `ffmpegBinary` | `ffmpeg` | Path to the ffmpeg binary (system dependency). |
 | `ABC_SCREENSHOT_DIR` | `screenshotDir` | `app/storage/screenshots` | Where screenshots are saved. |
 | `ABC_RECORDING_DIR` | `recordingDir` | `app/storage/recordings` | Where recordings are saved. |
+| `ABC_PROFILES_DIR` | `profilesDir` | `app/storage/profiles` | Root for named browser profiles. |
+| `ABC_ACTIVE_PROFILE_FILE` | `activeProfileFile` | `app/storage/active_profile.json` | Persisted active-profile pointer. |
 | `ABC_LOG_LEVEL` | `logLevel` | `INFO` | Log verbosity: `DEBUG` … `CRITICAL`. |
 
 Run `python start.py info` to print the resolved settings and storage paths.

@@ -35,8 +35,11 @@ app/storage/downloads/
 !app/storage/screenshots/.gitkeep
 !app/storage/recordings/.gitkeep
 
-# --- Persistent browser profile: cookies/tokens/logins — NEVER commit -------
+# --- Persistent browser profile(s): cookies/tokens/logins — NEVER commit ----
 app/storage/browser_profile/
+# Named multi-profiles and the active-profile pointer (all hold session data).
+app/storage/profiles/
+app/storage/active_profile.json
 
 # --- Generated captures / reports at the project root ----------------------
 # Screenshots, videos, and JSON dumps produced by runs or demo scripts.
