@@ -14,6 +14,7 @@ place to fan out to all connected agents.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any, Awaitable, Callable
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
@@ -32,6 +33,11 @@ class ConnectionManager:
 
     def __init__(self) -> None:
         self.activeConnections: list[WebSocket] = []
+        # SSE subscribers: each is an async queue fed by :meth:`publish`. SSE is a
+        # lightweight, one-way (server -> client) push — ideal for streaming
+        # progress / "long wait finished" events to plain HTTP clients without the
+        # overhead of a full WebSocket.
+        self.sseQueues: list[asyncio.Queue[dict[str, Any]]] = []
 
     async def connect(self, websocket: WebSocket) -> None:
         """Accept *websocket* and register it as active."""
@@ -60,6 +66,31 @@ class ConnectionManager:
                 stale.append(connection)
         for connection in stale:
             self.disconnect(connection)
+        self.publish(payload)
+
+    # ------------------------------------------------------------------ #
+    # SSE (server-sent events) — lightweight one-way push to HTTP clients
+    # ------------------------------------------------------------------ #
+    def subscribe(self) -> "asyncio.Queue[dict[str, Any]]":
+        """Register and return a queue that receives every published event."""
+        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        self.sseQueues.append(queue)
+        logger.info("SSE subscriber added (%d active)", len(self.sseQueues))
+        return queue
+
+    def unsubscribe(self, queue: "asyncio.Queue[dict[str, Any]]") -> None:
+        """Drop an SSE subscriber queue (idempotent)."""
+        if queue in self.sseQueues:
+            self.sseQueues.remove(queue)
+        logger.info("SSE subscriber removed (%d active)", len(self.sseQueues))
+
+    def publish(self, payload: dict[str, Any]) -> None:
+        """Fan *payload* out to every SSE subscriber (non-blocking, best-effort)."""
+        for queue in list(self.sseQueues):
+            try:
+                queue.put_nowait(payload)
+            except Exception:  # noqa: BLE001 - a full/closed queue must not stop the rest
+                logger.debug("Failed to enqueue SSE payload for a subscriber")
 
 
 # Process-wide connection registry shared across all ``/ws`` handlers.
@@ -84,6 +115,16 @@ def _buildDispatchTable() -> dict[str, DispatchFn]:
         "close_browser": lambda manager, params: manager.closeBrowser(),
         "set_headless": lambda manager, params: manager.setHeadless(params.get("headless", True)),
         "clear_profile": lambda manager, params: manager.clearProfile(),
+        # Profiles
+        "list_profiles": lambda manager, params: manager.listProfiles(),
+        "select_profile": lambda manager, params: manager.selectProfile(params["name"]),
+        "create_profile": lambda manager, params: manager.createProfile(
+            params["name"], makeActive=params.get("makeActive", True)
+        ),
+        "get_active_profile": lambda manager, params: manager.getActiveProfile(),
+        "login_session": lambda manager, params: manager.loginSession(
+            profile=params.get("profile"), url=params.get("url")
+        ),
         # Navigation
         "navigate": lambda manager, params: manager.navigate(
             params["url"],
@@ -116,18 +157,20 @@ def _buildDispatchTable() -> dict[str, DispatchFn]:
             button=params.get("button", "left"),
             clickCount=params.get("clickCount", 1),
             timeoutMs=params.get("timeoutMs"),
+            humanize=params.get("humanize"),
         ),
         "double_click": lambda manager, params: manager.doubleClick(
-            params["selector"], timeoutMs=params.get("timeoutMs")
+            params["selector"], timeoutMs=params.get("timeoutMs"), humanize=params.get("humanize")
         ),
         "right_click": lambda manager, params: manager.rightClick(
-            params["selector"], timeoutMs=params.get("timeoutMs")
+            params["selector"], timeoutMs=params.get("timeoutMs"), humanize=params.get("humanize")
         ),
         "fill": lambda manager, params: manager.fill(
             params["selector"],
             params["value"],
             clearFirst=params.get("clearFirst", True),
             timeoutMs=params.get("timeoutMs"),
+            humanize=params.get("humanize"),
         ),
         "upload_file": lambda manager, params: manager.uploadFile(
             params["selector"], params["filePaths"]
@@ -136,6 +179,7 @@ def _buildDispatchTable() -> dict[str, DispatchFn]:
             params["selector"],
             saveDir=params.get("saveDir"),
             timeoutMs=params.get("timeoutMs"),
+            imagesOnly=params.get("imagesOnly", True),
         ),
         "press_keys": lambda manager, params: manager.pressKeys(
             params["keys"], selector=params.get("selector")
@@ -148,6 +192,19 @@ def _buildDispatchTable() -> dict[str, DispatchFn]:
         ),
         "wait_for_network_idle": lambda manager, params: manager.waitForNetworkIdle(
             timeoutMs=params.get("timeoutMs")
+        ),
+        "wait_for_stable": lambda manager, params: manager.waitForStable(
+            params["selector"],
+            stableMs=params.get("stableMs", 1200),
+            timeoutMs=params.get("timeoutMs"),
+        ),
+        "wait_for_response": lambda manager, params: manager.waitForResponse(
+            params["urlPattern"], timeoutMs=params.get("timeoutMs")
+        ),
+        # No-image mode (MarkItDown)
+        "to_markdown": lambda manager, params: manager.toMarkdown(params["source"]),
+        "set_no_image_mode": lambda manager, params: manager.setNoImageMode(
+            params.get("enabled", True)
         ),
         # Visual intelligence
         "take_screenshot": lambda manager, params: manager.takeScreenshot(

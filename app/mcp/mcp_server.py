@@ -37,34 +37,42 @@ mcp = FastMCP("ai-browser-controller")
 @mcp.tool(name="open_browser")
 @safeAsync(action="open_browser")
 async def openBrowser(
+    profile: str | None = None,
     headless: bool | None = None,
     browserType: str = "chromium",
     viewportWidth: int | None = None,
     viewportHeight: int | None = None,
     userAgent: str | None = None,
 ) -> dict[str, Any]:
-    """Launch a PERSISTENT browser profile — you choose headless or headed.
+    """Launch a PERSISTENT browser profile — headless by default, headed on demand.
 
-    The session reuses an on-disk profile, so cookies, tokens and logins (Gmail,
-    etc.) PERSIST across runs: if the user logged in before, they're still logged
-    in now.
+    PROFILE SELECTION (important): a profile is one Chrome "user" with its own
+    logins/cookies. If you do NOT pass ``profile`` and no profile is active yet,
+    this returns ``status: "profile_selection_required"`` with the list of
+    available profiles instead of launching. When that happens you MUST ask the
+    user which profile to use (or to pick one at random):
+    - If you have a way to ask the user (e.g. an AskUserQuestion tool), use it.
+    - Otherwise, present the returned profile names plus "random" / "create a new
+      one" to the user and STOP, waiting for their reply.
+    Then call ``open_browser`` again with ``profile=<name>`` or ``profile="random"``
+    (or call ``select_profile`` first). The chosen profile is remembered on disk,
+    so later chats reuse the SAME profile automatically without re-asking.
 
-    Choose the mode:
-    - ``headless=True`` (default): no visible window — fast, for autonomous work.
-    - ``headless=False``: a real visible window. Use this when a HUMAN must act
-      manually — solving a captcha / "are you human" check, or a first-time login
-      the AI shouldn't do. You can also flip a running browser with
-      ``set_headless`` without losing state.
+    Logins (Gmail, etc.) PERSIST across runs within a profile. Use
+    ``login_session`` for first-time manual logins/sign-ups.
 
     Args:
-        headless: ``False`` to show a real window for manual/human interaction,
-            ``True`` for no window. Omit to use the server's configured default
-            (the ``ABC_HEADLESS`` setting).
+        profile: Profile name to use, or ``"random"`` to pick one. Omit to use the
+            remembered active profile (or trigger selection if none is set yet).
+        headless: ``False`` for a visible window (human/manual steps), ``True`` for
+            none. Omit for the server default (``ABC_HEADLESS``).
         browserType: ``chromium`` (default), ``firefox``, or ``webkit``.
         viewportWidth / viewportHeight: optional window size in pixels.
         userAgent: optional custom User-Agent string.
     """
     kwargs: dict[str, Any] = {"browserType": browserType}
+    if profile is not None:
+        kwargs["profile"] = profile
     if headless is not None:
         kwargs["headless"] = headless
     if viewportWidth:
@@ -74,6 +82,63 @@ async def openBrowser(
     if userAgent:
         kwargs["userAgent"] = userAgent
     return await getBrowserManager().openBrowser(**kwargs)
+
+
+# --------------------------------------------------------------------- #
+# Profiles (multi-account; the active one persists across chats)
+# --------------------------------------------------------------------- #
+@mcp.tool(name="list_profiles")
+@safeAsync(action="list_profiles")
+async def listProfiles() -> dict[str, Any]:
+    """List the available browser profiles and which one is currently active.
+
+    Use this to show the user their choices before opening a browser. Each
+    profile is an isolated Chrome "user" with its own logins/cookies.
+    """
+    return await getBrowserManager().listProfiles()
+
+
+@mcp.tool(name="select_profile")
+@safeAsync(action="select_profile")
+async def selectProfile(name: str) -> dict[str, Any]:
+    """Set the active browser profile (remembered across chats).
+
+    Args:
+        name: The profile to activate, or ``"random"`` to pick an existing one.
+            Creates the profile directory if it does not exist yet. After this,
+            ``open_browser``/``navigate`` use this profile until changed.
+    """
+    return await getBrowserManager().selectProfile(name)
+
+
+@mcp.tool(name="create_profile")
+@safeAsync(action="create_profile")
+async def createProfile(name: str, makeActive: bool = True) -> dict[str, Any]:
+    """Create a new, empty browser profile (a fresh Chrome "user").
+
+    Args:
+        name: Name for the new profile (slugified to letters/digits/_/-).
+        makeActive: When ``True`` (default), also make it the active profile.
+    """
+    return await getBrowserManager().createProfile(name, makeActive=makeActive)
+
+
+@mcp.tool(name="login_session")
+@safeAsync(action="login_session")
+async def loginSession(profile: str | None = None, url: str | None = None) -> dict[str, Any]:
+    """Open a VISIBLE browser on a profile so the USER can log in / sign up.
+
+    Use this for sites that need a real human to authenticate (Google account,
+    creating a new account, solving a captcha) before the agent can automate
+    them. The window opens headed; the user logs in; the session is saved into
+    the profile so all future automated runs are already logged in.
+
+    Args:
+        profile: Profile to log into (or ``"random"``). If omitted and none is
+            active, returns ``profile_selection_required`` — ask the user first.
+        url: Optional URL to open for the login (e.g. the site's sign-in page).
+    """
+    return await getBrowserManager().loginSession(profile=profile, url=url)
 
 
 @mcp.tool(name="set_headless")
@@ -324,16 +389,23 @@ async def scroll(
     selector: str | None = None,
     toTop: bool = False,
     toBottom: bool = False,
+    humanize: bool | None = None,
 ) -> dict[str, Any]:
-    """Scroll the page or a scrollable element.
+    """Scroll the page or a scrollable element (human-like by default).
+
+    By default scrolling is lazy and incremental — small wheel flicks with
+    pauses, like a human discovering the page — rather than an instant jump, so
+    it looks natural to bot-detection.
 
     Args:
         deltaY: Vertical scroll amount in pixels (positive scrolls down).
         deltaX: Horizontal scroll amount in pixels (positive scrolls right).
-        selector: Optional CSS selector of the element to scroll; defaults to the
-            page/window.
-        toTop: When ``True``, jump to the top, ignoring the deltas.
-        toBottom: When ``True``, jump to the bottom, ignoring the deltas.
+        selector: Optional CSS selector to scroll into view (lazily); defaults to
+            the page/window.
+        toTop: When ``True``, scroll to the top, ignoring the deltas.
+        toBottom: When ``True``, scroll to the bottom, ignoring the deltas.
+        humanize: Force human-like (``True``) or instant (``False``) scrolling;
+            ``None`` uses the server default (``ABC_HUMANIZE``).
     """
     return await getBrowserManager().scroll(
         deltaX=deltaX,
@@ -341,6 +413,7 @@ async def scroll(
         selector=selector,
         toTop=toTop,
         toBottom=toBottom,
+        humanize=humanize,
     )
 
 
@@ -364,8 +437,13 @@ async def click(
     button: str = "left",
     clickCount: int = 1,
     timeoutMs: int | None = None,
+    humanize: bool | None = None,
 ) -> dict[str, Any]:
-    """Click the element matched by ``selector``.
+    """Click the element matched by ``selector`` (human-like cursor by default).
+
+    By default the cursor travels a curved, slightly wobbling path from where it
+    last was to a random point inside the target, pauses, then presses — never a
+    straight teleport to the exact center — so cursor-movement bot checks pass.
 
     Args:
         selector: CSS selector of the element to click.
@@ -373,36 +451,46 @@ async def click(
         clickCount: Number of clicks to deliver (e.g. ``2`` for a double click).
         timeoutMs: Optional wait timeout in milliseconds; ``None`` uses the
             server default.
+        humanize: Force human-like (``True``) or instant (``False``) clicking;
+            ``None`` uses the server default (``ABC_HUMANIZE``).
     """
     return await getBrowserManager().click(
-        selector, button=button, clickCount=clickCount, timeoutMs=timeoutMs
+        selector, button=button, clickCount=clickCount, timeoutMs=timeoutMs, humanize=humanize
     )
 
 
 @mcp.tool(name="double_click")
 @safeAsync(action="double_click")
-async def doubleClick(selector: str, timeoutMs: int | None = None) -> dict[str, Any]:
-    """Double-click the element matched by ``selector``.
+async def doubleClick(
+    selector: str, timeoutMs: int | None = None, humanize: bool | None = None
+) -> dict[str, Any]:
+    """Double-click the element matched by ``selector`` (human-like by default).
 
     Args:
         selector: CSS selector of the element to double-click.
         timeoutMs: Optional wait timeout in milliseconds; ``None`` uses the
             server default.
+        humanize: Force human-like (``True``) or instant (``False``) clicking;
+            ``None`` uses the server default (``ABC_HUMANIZE``).
     """
-    return await getBrowserManager().doubleClick(selector, timeoutMs=timeoutMs)
+    return await getBrowserManager().doubleClick(selector, timeoutMs=timeoutMs, humanize=humanize)
 
 
 @mcp.tool(name="right_click")
 @safeAsync(action="right_click")
-async def rightClick(selector: str, timeoutMs: int | None = None) -> dict[str, Any]:
+async def rightClick(
+    selector: str, timeoutMs: int | None = None, humanize: bool | None = None
+) -> dict[str, Any]:
     """Right-click (context-menu click) the element matched by ``selector``.
 
     Args:
         selector: CSS selector of the element to right-click.
         timeoutMs: Optional wait timeout in milliseconds; ``None`` uses the
             server default.
+        humanize: Force human-like (``True``) or instant (``False``) clicking;
+            ``None`` uses the server default (``ABC_HUMANIZE``).
     """
-    return await getBrowserManager().rightClick(selector, timeoutMs=timeoutMs)
+    return await getBrowserManager().rightClick(selector, timeoutMs=timeoutMs, humanize=humanize)
 
 
 @mcp.tool(name="fill")
@@ -412,8 +500,13 @@ async def fill(
     value: str,
     clearFirst: bool = True,
     timeoutMs: int | None = None,
+    humanize: bool | None = None,
 ) -> dict[str, Any]:
     """Type ``value`` into the input/textarea matched by ``selector``.
+
+    By default typing is HUMAN-PACED (~25 WPM with natural jitter and the odd
+    pause) and the field is reached by moving the cursor there and clicking to
+    focus — so it does not look like a machine pasted the whole string at once.
 
     Args:
         selector: CSS selector of the input element.
@@ -421,9 +514,11 @@ async def fill(
         clearFirst: When ``True``, clear any existing content before typing.
         timeoutMs: Optional wait timeout in milliseconds; ``None`` uses the
             server default.
+        humanize: Force human-paced (``True``) or instant (``False``) typing;
+            ``None`` uses the server default (``ABC_HUMANIZE``).
     """
     return await getBrowserManager().fill(
-        selector, value, clearFirst=clearFirst, timeoutMs=timeoutMs
+        selector, value, clearFirst=clearFirst, timeoutMs=timeoutMs, humanize=humanize
     )
 
 
@@ -445,17 +540,28 @@ async def downloadFile(
     selector: str,
     saveDir: str | None = None,
     timeoutMs: int | None = None,
+    imagesOnly: bool = True,
 ) -> dict[str, Any]:
-    """Click ``selector`` to trigger a download and save the resulting file.
+    """Click ``selector`` to trigger a download and save the resulting file SAFELY.
+
+    By default only REAL images are kept: the saved file's actual bytes are
+    inspected (magic number + full decode) and anything that is really an
+    executable/app/archive disguised as an image — or any non-image — is deleted
+    and reported as an error. This blocks "download this image" malware lures.
+    Downloads may take a long time, so the wait ceiling is generous (up to ~1h,
+    ``ABC_MAX_DOWNLOAD_WAIT_MS``).
 
     Args:
         selector: CSS selector of the element that initiates the download.
         saveDir: Optional directory to save into; ``None`` uses the server's
             default download directory.
-        timeoutMs: Optional wait timeout in milliseconds; ``None`` uses the
-            server default.
+        timeoutMs: Optional wait ceiling in ms; ``None`` uses the long download max.
+        imagesOnly: Keep only verified images (default ``True``). Set ``False`` to
+            allow any file (use only when you trust the source).
     """
-    return await getBrowserManager().downloadFile(selector, saveDir=saveDir, timeoutMs=timeoutMs)
+    return await getBrowserManager().downloadFile(
+        selector, saveDir=saveDir, timeoutMs=timeoutMs, imagesOnly=imagesOnly
+    )
 
 
 @mcp.tool(name="press_keys")
@@ -504,6 +610,79 @@ async def waitForNetworkIdle(timeoutMs: int | None = None) -> dict[str, Any]:
             server default.
     """
     return await getBrowserManager().waitForNetworkIdle(timeoutMs=timeoutMs)
+
+
+@mcp.tool(name="wait_for_stable")
+@safeAsync(action="wait_for_stable")
+async def waitForStable(
+    selector: str,
+    stableMs: int = 1200,
+    timeoutMs: int | None = None,
+) -> dict[str, Any]:
+    """Wait QUIETLY until an element's text stops changing, then return its text.
+
+    This is the right way to wait for a slow online AI (ChatGPT, etc.): the
+    answer streams in token by token, then stops. Point ``selector`` at the
+    response container and this resolves once the text has been unchanged for
+    ``stableMs`` — no polling loops, no fixed sleeps. Capped at 5 minutes by
+    default (``ABC_MAX_WAIT_MS``).
+
+    Args:
+        selector: CSS selector of the element whose text settles (the AI answer).
+        stableMs: How long the text must stay unchanged to count as done.
+        timeoutMs: Hard cap in ms; ``None`` uses the server max-wait (5 min).
+    """
+    return await getBrowserManager().waitForStable(selector, stableMs=stableMs, timeoutMs=timeoutMs)
+
+
+@mcp.tool(name="wait_for_response")
+@safeAsync(action="wait_for_response")
+async def waitForResponse(urlPattern: str, timeoutMs: int | None = None) -> dict[str, Any]:
+    """Wait until a network response whose URL contains ``urlPattern`` FINISHES.
+
+    Reads straight from the network layer: resolves the moment the matching
+    (possibly streamed/SSE) response closes — e.g. when an online AI's backend
+    has finished sending its answer. Often more reliable than watching the DOM.
+    Capped at 5 minutes by default (``ABC_MAX_WAIT_MS``).
+
+    Args:
+        urlPattern: Substring to match against response URLs (e.g.
+            ``"/backend-api/conversation"`` for ChatGPT).
+        timeoutMs: Hard cap in ms; ``None`` uses the server max-wait (5 min).
+    """
+    return await getBrowserManager().waitForResponse(urlPattern, timeoutMs=timeoutMs)
+
+
+# --------------------------------------------------------------------- #
+# No-image mode (MarkItDown) — read text instead of pixels
+# --------------------------------------------------------------------- #
+@mcp.tool(name="to_markdown")
+@safeAsync(action="to_markdown")
+async def toMarkdown(source: str) -> dict[str, Any]:
+    """Convert an image / PDF / Office doc / HTML page (file path or URL) to markdown.
+
+    Backed by Microsoft's MarkItDown. Use it to read media as text — e.g. extract
+    a PDF's contents, or describe a downloaded chart — without handling pixels.
+
+    Args:
+        source: A local file path or a URL to convert.
+    """
+    return await getBrowserManager().toMarkdown(source)
+
+
+@mcp.tool(name="set_no_image_mode")
+@safeAsync(action="set_no_image_mode")
+async def setNoImageMode(enabled: bool) -> dict[str, Any]:
+    """Toggle global no-image mode.
+
+    When ON, pixel screenshots are suppressed and you are steered to text:
+    ``read_page`` for page text and ``to_markdown`` to convert media. Turn it OFF
+    to allow screenshots again.
+
+    Args:
+        enabled: ``True`` to enable no-image mode, ``False`` to disable.
+    """
+    return await getBrowserManager().setNoImageMode(enabled)
 
 
 # --------------------------------------------------------------------- #

@@ -14,6 +14,8 @@ the file over the same origin. The ``/ws`` WebSocket route is contributed by
 
 from __future__ import annotations
 
+import asyncio
+import json
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
@@ -21,11 +23,11 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from app import __version__
-from app.api.websocket import registerWebSocket
+from app.api.websocket import connectionManager, registerWebSocket
 from app.browser.browser_manager import getBrowserManager
 from app.models.commands import (
     ClickCommand,
@@ -34,14 +36,21 @@ from app.models.commands import (
     FillCommand,
     HoverCommand,
     LaunchCommand,
+    LoginSessionCommand,
+    MarkdownCommand,
     NavigateCommand,
+    NoImageModeCommand,
     PressKeysCommand,
+    ProfileCreateCommand,
+    ProfileSelectCommand,
     RecordingCommand,
     ScreenshotCommand,
     ScrollCommand,
     TabCommand,
     UploadCommand,
     WaitForElementCommand,
+    WaitResponseCommand,
+    WaitStableCommand,
 )
 from app.utils.config import settings
 from app.utils.helpers import ensureDir, errorResponse
@@ -125,6 +134,31 @@ def createApp() -> FastAPI:
         logger.info("Request: status")
         return await getBrowserManager().status()
 
+    @app.get("/events")
+    async def events(request: Request) -> StreamingResponse:
+        """Server-Sent Events stream of browser/progress events.
+
+        A lightweight, one-way push channel: HTTP clients can subscribe here to
+        be notified when long waits finish or progress is published, instead of
+        polling. Heartbeats keep the connection alive through proxies.
+        """
+
+        async def eventStream() -> AsyncIterator[str]:
+            queue = connectionManager.subscribe()
+            try:
+                while True:
+                    if await request.is_disconnected():
+                        break
+                    try:
+                        payload = await asyncio.wait_for(queue.get(), timeout=15.0)
+                        yield f"data: {json.dumps(payload)}\n\n"
+                    except asyncio.TimeoutError:
+                        yield ": keep-alive\n\n"  # comment line = SSE heartbeat
+            finally:
+                connectionManager.unsubscribe(queue)
+
+        return StreamingResponse(eventStream(), media_type="text/event-stream")
+
     # ----------------------------------------------------------------- #
     # Browser lifecycle
     # ----------------------------------------------------------------- #
@@ -137,12 +171,37 @@ def createApp() -> FastAPI:
             viewportWidth=command.viewportWidth,
             viewportHeight=command.viewportHeight,
             userAgent=command.userAgent,
+            profile=command.profile,
+            channel=command.channel,
         )
 
     @app.post("/browser/close")
     async def closeBrowser() -> dict:
         logger.info("Request: close_browser")
         return await getBrowserManager().closeBrowser()
+
+    # ----------------------------------------------------------------- #
+    # Profiles (multi-account)
+    # ----------------------------------------------------------------- #
+    @app.get("/profiles")
+    async def listProfiles() -> dict:
+        logger.info("Request: list_profiles")
+        return await getBrowserManager().listProfiles()
+
+    @app.post("/profiles/select")
+    async def selectProfile(command: ProfileSelectCommand) -> dict:
+        logger.info("Request: select_profile -> %s", command.name)
+        return await getBrowserManager().selectProfile(command.name)
+
+    @app.post("/profiles/create")
+    async def createProfile(command: ProfileCreateCommand) -> dict:
+        logger.info("Request: create_profile -> %s", command.name)
+        return await getBrowserManager().createProfile(command.name, makeActive=command.makeActive)
+
+    @app.post("/browser/login-session")
+    async def loginSession(command: LoginSessionCommand) -> dict:
+        logger.info("Request: login_session")
+        return await getBrowserManager().loginSession(profile=command.profile, url=command.url)
 
     @app.post("/browser/set-headless")
     async def setHeadless(headless: bool = False) -> dict:
@@ -246,6 +305,7 @@ def createApp() -> FastAPI:
             button=command.button,
             clickCount=command.clickCount,
             timeoutMs=command.timeoutMs,
+            humanize=command.humanize,
         )
 
     @app.post("/interact/double-click")
@@ -277,6 +337,7 @@ def createApp() -> FastAPI:
             command.value,
             clearFirst=command.clearFirst,
             timeoutMs=command.timeoutMs,
+            humanize=command.humanize,
         )
 
     @app.post("/interact/scroll")
@@ -288,6 +349,7 @@ def createApp() -> FastAPI:
             selector=command.selector,
             toTop=command.toTop,
             toBottom=command.toBottom,
+            humanize=command.humanize,
         )
 
     @app.post("/interact/press-keys")
@@ -307,6 +369,7 @@ def createApp() -> FastAPI:
             command.selector,
             saveDir=command.saveDir,
             timeoutMs=command.timeoutMs,
+            imagesOnly=command.imagesOnly,
         )
 
     # ----------------------------------------------------------------- #
@@ -325,6 +388,33 @@ def createApp() -> FastAPI:
     async def waitForNetworkIdle() -> dict:
         logger.info("Request: wait_for_network_idle")
         return await getBrowserManager().waitForNetworkIdle()
+
+    @app.post("/wait/stable")
+    async def waitForStable(command: WaitStableCommand) -> dict:
+        logger.info("Request: wait_for_stable -> %s", command.selector)
+        return await getBrowserManager().waitForStable(
+            command.selector, stableMs=command.stableMs, timeoutMs=command.timeoutMs
+        )
+
+    @app.post("/wait/response")
+    async def waitForResponse(command: WaitResponseCommand) -> dict:
+        logger.info("Request: wait_for_response -> %s", command.urlPattern)
+        return await getBrowserManager().waitForResponse(
+            command.urlPattern, timeoutMs=command.timeoutMs
+        )
+
+    # ----------------------------------------------------------------- #
+    # No-image mode (MarkItDown)
+    # ----------------------------------------------------------------- #
+    @app.post("/markdown")
+    async def toMarkdown(command: MarkdownCommand) -> dict:
+        logger.info("Request: to_markdown -> %s", command.source)
+        return await getBrowserManager().toMarkdown(command.source)
+
+    @app.post("/no-image-mode")
+    async def setNoImageMode(command: NoImageModeCommand) -> dict:
+        logger.info("Request: set_no_image_mode -> %s", command.enabled)
+        return await getBrowserManager().setNoImageMode(command.enabled)
 
     # ----------------------------------------------------------------- #
     # Visual intelligence
