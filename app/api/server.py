@@ -400,7 +400,7 @@ def createApp() -> FastAPI:
     async def waitForResponse(command: WaitResponseCommand) -> dict:
         logger.info("Request: wait_for_response -> %s", command.urlPattern)
         return await getBrowserManager().waitForResponse(
-            command.urlPattern, timeoutMs=command.timeoutMs
+            command.urlPattern, timeoutMs=command.timeoutMs, includeQuery=command.includeQuery
         )
 
     # ----------------------------------------------------------------- #

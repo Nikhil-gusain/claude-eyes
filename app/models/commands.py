@@ -57,6 +57,9 @@ class WaitResponseCommand(BaseModel):
 
     urlPattern: str
     timeoutMs: Optional[int] = Field(default=None, ge=0, le=3_600_000)
+    includeQuery: bool = Field(
+        default=False, description="Match against the full URL (incl. query) instead of just the path."
+    )
 
 
 class MarkdownCommand(BaseModel):

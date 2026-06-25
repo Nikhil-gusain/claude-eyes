@@ -199,7 +199,9 @@ def _buildDispatchTable() -> dict[str, DispatchFn]:
             timeoutMs=params.get("timeoutMs"),
         ),
         "wait_for_response": lambda manager, params: manager.waitForResponse(
-            params["urlPattern"], timeoutMs=params.get("timeoutMs")
+            params["urlPattern"],
+            timeoutMs=params.get("timeoutMs"),
+            includeQuery=params.get("includeQuery", False),
         ),
         # No-image mode (MarkItDown)
         "to_markdown": lambda manager, params: manager.toMarkdown(params["source"]),

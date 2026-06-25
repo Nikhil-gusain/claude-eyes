@@ -13,9 +13,11 @@ multi-session support will later plug in.
 
 from __future__ import annotations
 
+import re
 import shutil
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlsplit
 
 from playwright.async_api import (
     Browser,
@@ -26,12 +28,37 @@ from playwright.async_api import (
 )
 
 from app.browser import humanize as humanizer
+from app.browser import stealth
 from app.browser.media import verifyImage
 from app.utils.config import settings
 from app.utils.helpers import ensureDir, utcTimestamp
 from app.utils.logger import getLogger
 
 logger = getLogger("browser.controller")
+
+
+def urlMatches(pattern: str, url: str, includeQuery: bool = False) -> bool:
+    """Whether *url* matches *pattern* — by scheme+host+path, query excluded by default.
+
+    ``wait_for_response`` used a plain substring over the *whole* URL, which let a
+    pattern like ``"duckchat"`` latch onto an unrelated request that merely had
+    ``cc=duckchat`` in its query string (e.g. a bot-detection beacon). Matching
+    against the path (no query/fragment) by default fixes that. *pattern* is tried
+    as a regex first (so callers can be precise, e.g. ``r"/backend-api/conversation$"``)
+    and falls back to a plain substring if it is not valid regex. Set
+    ``includeQuery=True`` to match against the full URL including the query.
+    """
+    if includeQuery:
+        target = url
+    else:
+        parts = urlsplit(url)
+        target = f"{parts.scheme}://{parts.netloc}{parts.path}"
+    try:
+        if re.search(pattern, target):
+            return True
+    except re.error:
+        pass
+    return pattern in target
 
 
 class PlaywrightController:
@@ -161,6 +188,10 @@ class PlaywrightController:
             contextArgs["channel"] = self.browserChannel
         if self.userAgent:
             contextArgs["user_agent"] = self.userAgent
+        # Stealth: strip the automation launch flags (Chromium-family only).
+        if settings.stealth and self.browserType == "chromium":
+            contextArgs["args"] = stealth.launchArgs()
+            contextArgs["ignore_default_args"] = stealth.ignoreDefaultArgs()
         if self.recordVideoDir is not None:
             contextArgs["record_video_dir"] = str(self.recordVideoDir)
             contextArgs["record_video_size"] = {
@@ -173,6 +204,14 @@ class PlaywrightController:
         )
         self._context.set_default_timeout(settings.defaultTimeoutMs)
         self._browser = self._context.browser
+
+        # Stealth: patch the common JS fingerprints (navigator.webdriver, etc.)
+        # before any page script runs. Applies to every current and future page.
+        if settings.stealth and self.browserType == "chromium":
+            try:
+                await self._context.add_init_script(stealth.STEALTH_INIT_JS)
+            except Exception as exc:  # noqa: BLE001 - stealth is best-effort
+                logger.debug("Failed to install stealth init script: %s", exc)
 
         # Capture network activity for the whole context (all tabs).
         self._context.on("response", self._onResponse)
@@ -725,19 +764,25 @@ class PlaywrightController:
         self,
         urlPattern: str,
         timeoutMs: int | None = None,
+        includeQuery: bool = False,
     ) -> dict[str, Any]:
-        """Wait until a network response whose URL contains *urlPattern* finishes.
+        """Wait until a network response matching *urlPattern* finishes.
 
         Reads straight from the network layer (the same stream the Network tab
         shows): resolves when the matching request *finishes* — i.e. its
         streaming/SSE body has fully closed — which is the moment an online AI has
         finished answering. Capped by ``settings.maxWaitMs`` (5 min) by default.
+
+        *urlPattern* is matched by :func:`urlMatches` — regex-or-substring against
+        the URL's scheme+host+path, **excluding the query string** so a loose
+        pattern can't latch onto a query parameter of an unrelated request (e.g. a
+        bot-detection beacon). Pass ``includeQuery=True`` to match the full URL.
         """
         timeout = timeoutMs if timeoutMs is not None else settings.maxWaitMs
         page = self.activePage
         response = await page.wait_for_event(
             "response",
-            predicate=lambda r: urlPattern in r.url,
+            predicate=lambda r: urlMatches(urlPattern, r.url, includeQuery),
             timeout=timeout,
         )
         # Await full completion of the (possibly streamed) body before returning.
@@ -767,6 +812,7 @@ class PlaywrightController:
             "profileName": self.profileName,
             "userDataDir": str(self.userDataDir),
             "humanize": settings.humanize,
+            "stealth": settings.stealth,
             "tabIndex": self._activeIndex,
             "tabCount": len(self._pages),
             "url": page.url if page else None,

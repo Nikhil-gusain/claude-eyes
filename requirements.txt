@@ -40,7 +40,10 @@ openai>=1.30             # OpenAI adapter
 # Microsoft's MarkItDown converts images/PDF/Office/HTML to markdown so an agent
 # can read media as text (the `to_markdown` tool + global no-image mode). Optional
 # at runtime: the media helpers degrade gracefully if it is not installed.
-markitdown>=0.0.1        # image/PDF/doc -> markdown (no-image mode)
+# The [pdf,docx,pptx,xlsx] extras pull the per-format backends — without them
+# base MarkItDown only handles HTML/text/CSV/JSON (PDF would raise
+# MissingDependency). `set_no_image_mode`/`to_markdown` report which formats work.
+markitdown[pdf,docx,pptx,xlsx]>=0.0.1  # image/PDF/Office -> markdown (no-image mode)
 
 # ----- test -----
 pytest>=8.0              # test runner

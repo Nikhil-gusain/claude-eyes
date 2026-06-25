@@ -336,11 +336,11 @@ class BrowserManager:
             self._guard(lambda: self.controller.waitForStable(selector, stableMs, timeoutMs)),
         )
 
-    async def waitForResponse(self, urlPattern: str, timeoutMs: int | None = None) -> dict[str, Any]:
+    async def waitForResponse(self, urlPattern: str, timeoutMs: int | None = None, includeQuery: bool = False) -> dict[str, Any]:
         """Wait until a network response matching ``urlPattern`` finishes streaming."""
         return await self._run(
             "wait_for_response",
-            self._guard(lambda: self.controller.waitForResponse(urlPattern, timeoutMs)),
+            self._guard(lambda: self.controller.waitForResponse(urlPattern, timeoutMs, includeQuery)),
         )
 
     # ------------------------------------------------------------------ #
@@ -405,7 +405,13 @@ class BrowserManager:
         """Toggle global no-image mode (suppress screenshots, prefer markdown)."""
         async def op() -> dict[str, Any]:
             self.noImageMode = enabled
-            return {"noImageMode": enabled, "markitdownAvailable": media.markitdownAvailable()}
+            return {
+                "noImageMode": enabled,
+                "markitdownAvailable": media.markitdownAvailable(),
+                # Honest per-format picture: base MarkItDown may be present while
+                # PDF/Office backends are not.
+                "markitdownFormats": media.markitdownFormats(),
+            }
 
         return await self._run("set_no_image_mode", op)
 

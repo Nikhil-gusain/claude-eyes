@@ -85,6 +85,11 @@ class Settings:
         # is incremental rather than an instant jump. Disable for raw speed.
         self.humanize: bool = _envBool("ABC_HUMANIZE", True)
         self.typingWpm: int = _envInt("ABC_TYPING_WPM", 25)
+        # Stealth shrinks the *automation fingerprint* (navigator.webdriver, the
+        # --enable-automation switch, the "controlled by automated software"
+        # banner, missing window.chrome). Humanization covers behaviour; this
+        # covers the fingerprint hardened sites read. Best with channel=chrome.
+        self.stealth: bool = _envBool("ABC_STEALTH", True)
 
         # ----- Event-driven waiting ----------------------------------------
         # Hard ceiling for "wait quietly for a slow thing" (e.g. an online AI's
@@ -119,6 +124,7 @@ class Settings:
             "defaultTimeoutMs": self.defaultTimeoutMs,
             "humanize": self.humanize,
             "typingWpm": self.typingWpm,
+            "stealth": self.stealth,
             "maxWaitMs": self.maxWaitMs,
             "maxDownloadWaitMs": self.maxDownloadWaitMs,
             "noImageMode": self.noImageMode,

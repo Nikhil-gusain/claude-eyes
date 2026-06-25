@@ -5,7 +5,8 @@ A plug-and-play browser automation layer that lets any AI agent — primarily **
 ## Features
 
 - **Full browser control** — launch/close, navigate (back/forward/refresh), tabs, click/double-click/right-click, hover, fill inputs, scroll, press keys, upload/download files, and waits — backed by Playwright.
-- **Humanized interaction (anti bot-detection)** — on by default: typing is paced (~25 WPM with natural jitter), the mouse travels a curved, wobbling path to a random point inside the target (never a straight teleport to the exact center) and remembers where it was, and scrolling is lazy/incremental like a human discovering the page. Force on/off per call with `humanize`, or globally with `ABC_HUMANIZE`. Optionally drive real Chrome via `ABC_BROWSER_CHANNEL=chrome`.
+- **Humanized interaction (anti bot-detection)** — on by default: typing is paced (~25 WPM with natural jitter), the mouse travels a curved, wobbling path to a random point inside the target (never a straight teleport to the exact center) and remembers where it was, and scrolling is lazy/incremental like a human discovering the page. Force on/off per call with `humanize`, or globally with `ABC_HUMANIZE`.
+- **Stealth (smaller automation fingerprint)** — on by default (`ABC_STEALTH`): strips the `--enable-automation` switch / "controlled by automated software" banner and patches the common JS tells (`navigator.webdriver`, `window.chrome`, plugins/languages). Humanization covers *behaviour*; stealth covers the *fingerprint*. Best paired with the real-Chrome channel (`ABC_BROWSER_CHANNEL=chrome`). **Caveat:** hardened identity providers (notably **Google sign-in**) may still block automated contexts even so — prefer a less aggressive provider for login tests, or log in to Google manually once in a headed window and rely on the persistent profile thereafter.
 - **Multiple Chrome profiles** — named, isolated profiles (each its own logins/cookies). The chosen profile is **remembered on disk and auto-reopens in later chats**; `open_browser` asks which profile to use (or random) the first time. Tools: `list_profiles`, `select_profile`, `create_profile`, and `login_session` (opens a headed window so a human can log in / sign up, then saves the session for future automated runs).
 - **Event-driven waiting** — wait *quietly* for slow things instead of polling: `wait_for_stable` resolves when an element's text stops changing (perfect for an online AI's streamed answer), and `wait_for_response` resolves when a matching network response finishes streaming. Capped at 5 min by default (`ABC_MAX_WAIT_MS`); downloads get up to ~1h (`ABC_MAX_DOWNLOAD_WAIT_MS`). An SSE `/events` stream pushes progress to HTTP clients.
 - **Safe downloads** — `download_file` keeps **verified real images only** by default: the saved bytes are inspected (magic number + full decode) and anything that is actually an executable/app/archive disguised as an image is deleted and reported as an error.
@@ -43,6 +44,7 @@ Module map:
 | --- | --- |
 | `app/browser/playwright_controller.py` | Thin async wrapper over Playwright (launch, navigate, interact, extract). Routes typing/clicking/scrolling through the humanizer and tracks cursor position. |
 | `app/browser/humanize.py` | Human-like primitives: paced typing, curved/jittered mouse travel, lazy scroll. |
+| `app/browser/stealth.py` | Anti-detection launch flags + JS init script that shrink the automation fingerprint. |
 | `app/browser/profiles.py` | `ProfileManager` — named profiles under `storage/profiles/` and the persisted active-profile pointer (`getProfileManager()` singleton). |
 | `app/browser/media.py` | `verifyImage` (download safety) and `toMarkdown` (MarkItDown, no-image mode). |
 | `app/browser/screenshot_manager.py` | Capture and save screenshots (viewport / full page / element / annotated). |
@@ -307,6 +309,7 @@ All runtime settings are resolved once at import time from `ABC_*` environment v
 | `ABC_USER_AGENT` | `userAgent` | _(browser default)_ | Optional custom User-Agent. |
 | `ABC_HUMANIZE` | `humanize` | `true` | Human-like typing/clicking/scrolling (anti bot-detection). |
 | `ABC_TYPING_WPM` | `typingWpm` | `25` | Typing speed in words/min (with jitter). |
+| `ABC_STEALTH` | `stealth` | `true` | Reduce the automation fingerprint (webdriver flag, automation switches). |
 | `ABC_MAX_WAIT_MS` | `maxWaitMs` | `300000` | Ceiling for quiet/event-driven waits (5 min). |
 | `ABC_MAX_DOWNLOAD_WAIT_MS` | `maxDownloadWaitMs` | `3600000` | Ceiling for downloads (1 h). |
 | `ABC_NO_IMAGE_MODE` | `noImageMode` | `false` | Start in no-image mode (markdown over pixels). |

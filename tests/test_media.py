@@ -49,6 +49,17 @@ def test_acceptsRealPng(tmp_path: Path) -> None:
     assert verdict["format"] == "png"
 
 
+def test_markitdownFormatsReportsPerFormat() -> None:
+    formats = media.markitdownFormats()
+    # Always a dict keyed by the known formats, each a bool — never a single
+    # misleading "available" flag.
+    assert isinstance(formats, dict)
+    assert set(formats) >= {"pdf", "docx", "pptx", "xlsx", "html"}
+    assert all(isinstance(v, bool) for v in formats.values())
+    if not media.markitdownAvailable():
+        assert all(v is False for v in formats.values())
+
+
 def test_toMarkdownDegradesGracefully(tmp_path: Path) -> None:
     sample = tmp_path / "note.txt"
     sample.write_text("hello world", encoding="utf-8")

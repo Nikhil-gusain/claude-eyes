@@ -102,12 +102,52 @@ def verifyImage(path: Path | str) -> dict[str, Any]:
 
 
 def markitdownAvailable() -> bool:
-    """Return whether the optional MarkItDown dependency can be imported."""
+    """Return whether the base MarkItDown package can be imported.
+
+    Note: this being ``True`` does NOT mean every format works — PDF/Office
+    support comes from optional extras. Use :func:`markitdownFormats` for the
+    honest per-format picture.
+    """
     try:
         import markitdown  # noqa: F401
     except Exception:  # noqa: BLE001 - treat any import failure as unavailable
         return False
     return True
+
+
+# Maps a human format label to the third-party module its MarkItDown converter
+# needs. Base MarkItDown ships HTML/plain-text/CSV/JSON; the rest are extras
+# (``pip install 'markitdown[pdf,docx,pptx,xlsx]'``).
+# The import name is the converter's actual backend, which is NOT always the
+# obvious one — MarkItDown reads .docx via `mammoth`, .pdf via `pdfminer`, etc.
+_FORMAT_BACKENDS: dict[str, str] = {
+    "html": "markitdown",
+    "pdf": "pdfminer",
+    "docx": "mammoth",
+    "pptx": "pptx",
+    "xlsx": "openpyxl",
+    "xls": "xlrd",
+}
+
+
+def markitdownFormats() -> dict[str, bool]:
+    """Probe which MarkItDown formats are actually usable in this environment.
+
+    Returns a ``{format: bool}`` map so callers (and the agent) can tell that,
+    e.g., base MarkItDown is installed but PDF support is not — instead of being
+    misled by a single ``markitdownAvailable: true`` flag.
+    """
+    if not markitdownAvailable():
+        return {fmt: False for fmt in _FORMAT_BACKENDS}
+    import importlib.util
+
+    formats: dict[str, bool] = {}
+    for fmt, module in _FORMAT_BACKENDS.items():
+        try:
+            formats[fmt] = importlib.util.find_spec(module) is not None
+        except (ImportError, ValueError):
+            formats[fmt] = False
+    return formats
 
 
 def toMarkdown(source: str) -> dict[str, Any]:
@@ -131,6 +171,16 @@ def toMarkdown(source: str) -> dict[str, Any]:
         text = getattr(result, "text_content", "") or ""
     except Exception as exc:  # noqa: BLE001 - surface as structured error, never raise
         logger.warning("MarkItDown conversion failed for %s: %s", source, exc)
-        return {"error": "conversion failed", "details": f"{type(exc).__name__}: {exc}"}
+        detail = f"{type(exc).__name__}: {exc}"
+        # A MissingDependency failure means an optional backend (e.g. PDF) is
+        # absent — tell the caller exactly how to fix it rather than a bare error.
+        if "MissingDependency" in type(exc).__name__ or "MissingDependency" in str(exc):
+            return {
+                "error": "missing format backend",
+                "details": detail,
+                "hint": "Install the optional extra, e.g. pip install 'markitdown[pdf,docx,pptx,xlsx]'.",
+                "formats": markitdownFormats(),
+            }
+        return {"error": "conversion failed", "details": detail}
 
     return {"markdown": text, "source": source, "chars": len(text)}

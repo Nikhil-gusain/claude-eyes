@@ -637,20 +637,32 @@ async def waitForStable(
 
 @mcp.tool(name="wait_for_response")
 @safeAsync(action="wait_for_response")
-async def waitForResponse(urlPattern: str, timeoutMs: int | None = None) -> dict[str, Any]:
-    """Wait until a network response whose URL contains ``urlPattern`` FINISHES.
+async def waitForResponse(
+    urlPattern: str, timeoutMs: int | None = None, includeQuery: bool = False
+) -> dict[str, Any]:
+    """Wait until a network response matching ``urlPattern`` FINISHES.
 
     Reads straight from the network layer: resolves the moment the matching
     (possibly streamed/SSE) response closes — e.g. when an online AI's backend
     has finished sending its answer. Often more reliable than watching the DOM.
     Capped at 5 minutes by default (``ABC_MAX_WAIT_MS``).
 
+    MATCHING: ``urlPattern`` is matched (regex first, else substring) against the
+    URL's scheme+host+**path** — the query string is EXCLUDED by default, so a
+    loose pattern won't accidentally latch onto a query parameter of an unrelated
+    request (e.g. a bot-detection beacon like ``/anomaly.js?cc=duckchat``). Prefer
+    a path-anchored pattern such as ``"/backend-api/conversation"``. The returned
+    ``url`` shows exactly what matched — check it. Set ``includeQuery=True`` only
+    if the discriminating part really lives in the query string.
+
     Args:
-        urlPattern: Substring to match against response URLs (e.g.
-            ``"/backend-api/conversation"`` for ChatGPT).
+        urlPattern: Regex or substring matched against the response URL's path.
         timeoutMs: Hard cap in ms; ``None`` uses the server max-wait (5 min).
+        includeQuery: Match against the full URL (including query) instead of path.
     """
-    return await getBrowserManager().waitForResponse(urlPattern, timeoutMs=timeoutMs)
+    return await getBrowserManager().waitForResponse(
+        urlPattern, timeoutMs=timeoutMs, includeQuery=includeQuery
+    )
 
 
 # --------------------------------------------------------------------- #
@@ -723,6 +735,9 @@ async def screenshot(fullPage: bool = False, selector: str | None = None) -> Ima
     storage. Use ``take_screenshot`` instead only when you explicitly want a saved
     file path.
 
+    When no-image mode is ON, this returns a short text notice (no pixels) instead
+    of an image — use ``read_page`` / ``to_markdown`` to read the page as text.
+
     Args:
         fullPage: When ``True``, capture the entire scrollable page.
         selector: Optional CSS selector to capture only that element.
@@ -730,7 +745,12 @@ async def screenshot(fullPage: bool = False, selector: str | None = None) -> Ima
     result = await getBrowserManager().captureScreenshotData(fullPage=fullPage, selector=selector)
     if not result.get("success"):
         raise RuntimeError(result.get("details") or result.get("error") or "screenshot failed")
-    return Image(data=result["data"]["image"], format="png")
+    data = result.get("data", {})
+    # No-image mode short-circuits to a notice with no "image" key — return that
+    # as text instead of trying to build an (absent) image block.
+    if data.get("noImageMode") or "image" not in data:
+        return data.get("note", "No-image mode is on; screenshots are suppressed.")
+    return Image(data=data["image"], format="png")
 
 
 @mcp.tool(name="clear_storage")
