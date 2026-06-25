@@ -25,6 +25,8 @@ from playwright.async_api import (
     async_playwright,
 )
 
+from app.browser import humanize as humanizer
+from app.browser.media import verifyImage
 from app.utils.config import settings
 from app.utils.helpers import ensureDir, utcTimestamp
 from app.utils.logger import getLogger
@@ -51,9 +53,19 @@ class PlaywrightController:
         # Launch options remembered so we can relaunch the SAME persistent
         # profile when toggling headless/headed or (re)starting video recording.
         self.browserType: str = settings.browserType
+        self.browserChannel: Optional[str] = settings.browserChannel
         self.headless: bool = settings.headless
         self.userAgent: Optional[str] = settings.userAgent
         self.userDataDir: Path = settings.userDataDir
+        # Name of the active named profile backing ``userDataDir`` (if any).
+        self.profileName: Optional[str] = None
+
+        # Last known mouse position, so human-like moves curve from where the
+        # cursor actually was rather than always starting at the origin.
+        self._cursor: tuple[float, float] = (
+            settings.viewportWidth / 2,
+            settings.viewportHeight / 2,
+        )
 
         # Rolling log of network activity, captured at the context level so it
         # spans every tab. Bounded so a long session can't exhaust memory.
@@ -81,12 +93,21 @@ class PlaywrightController:
         viewportHeight: int | None = None,
         userAgent: str | None = None,
         recordVideoDir: Path | None = None,
+        userDataDir: Path | None = None,
+        profileName: str | None = None,
+        channel: str | None = None,
     ) -> dict[str, Any]:
         """Start Playwright and open a PERSISTENT browser profile.
 
         The session uses ``launch_persistent_context`` against a fixed
         user-data directory, so cookies, tokens and localStorage survive across
         process restarts — e.g. a Gmail login stays logged in next time.
+
+        ``userDataDir``/``profileName`` select which named profile to drive (the
+        :class:`~app.browser.profiles.ProfileManager` resolves these); omitting
+        them keeps the legacy single-profile directory. ``channel`` (e.g.
+        ``"chrome"``) drives a real installed browser instead of bundled
+        Chromium — harder for bot-detection to flag.
         """
         if self.isRunning:
             logger.warning("launchBrowser called while a browser is already running")
@@ -99,16 +120,24 @@ class PlaywrightController:
         self.viewportHeight = viewportHeight or settings.viewportHeight
         self.userAgent = userAgent or settings.userAgent
         self.recordVideoDir = recordVideoDir
+        if userDataDir is not None:
+            self.userDataDir = Path(userDataDir)
+        if profileName is not None:
+            self.profileName = profileName
+        if channel is not None:
+            self.browserChannel = channel
+        self._cursor = (self.viewportWidth / 2, self.viewportHeight / 2)
 
         self._playwright = await async_playwright().start()
         await self._launchPersistentContext()
 
         logger.info(
-            "Launched %s persistent profile (headless=%s, %dx%d, dir=%s)",
+            "Launched %s persistent profile (headless=%s, %dx%d, profile=%s, dir=%s)",
             self.browserType,
             self.headless,
             self.viewportWidth,
             self.viewportHeight,
+            self.profileName or "<default>",
             self.userDataDir,
         )
         return self._stateSnapshot()
@@ -128,6 +157,8 @@ class PlaywrightController:
             "viewport": {"width": self.viewportWidth, "height": self.viewportHeight},
             "accept_downloads": True,
         }
+        if self.browserChannel:
+            contextArgs["channel"] = self.browserChannel
         if self.userAgent:
             contextArgs["user_agent"] = self.userAgent
         if self.recordVideoDir is not None:
@@ -458,18 +489,32 @@ class PlaywrightController:
         selector: str | None = None,
         toTop: bool = False,
         toBottom: bool = False,
+        humanize: bool | None = None,
     ) -> dict[str, Any]:
         page = self.activePage
+        human = humanizer.shouldHumanize(humanize)
         if selector:
-            await page.locator(selector).scroll_into_view_if_needed()
+            if human:
+                await humanizer.humanScrollToSelector(page, selector, settings.defaultTimeoutMs)
+            else:
+                await page.locator(selector).scroll_into_view_if_needed()
         elif toTop:
-            await page.evaluate("() => window.scrollTo(0, 0)")
+            # Lazy "scroll up to discover" rather than snapping to the very top.
+            if human:
+                await humanizer.humanScrollBy(page, -10_000_000)
+            else:
+                await page.evaluate("() => window.scrollTo(0, 0)")
         elif toBottom:
-            await page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+            if human:
+                await humanizer.humanScrollBy(page, 10_000_000)
+            else:
+                await page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+        elif human and (deltaY or deltaX):
+            await humanizer.humanScrollBy(page, deltaY, deltaX)
         else:
             await page.mouse.wheel(deltaX, deltaY)
         position = await page.evaluate("() => ({ x: window.scrollX, y: window.scrollY })")
-        return {"scroll": position}
+        return {"scroll": position, "humanized": human}
 
     async def hoverElement(self, selector: str, timeoutMs: int | None = None) -> dict[str, Any]:
         await self.activePage.hover(selector, timeout=timeoutMs or settings.defaultTimeoutMs)
@@ -481,24 +526,49 @@ class PlaywrightController:
         button: str = "left",
         clickCount: int = 1,
         timeoutMs: int | None = None,
+        humanize: bool | None = None,
     ) -> dict[str, Any]:
-        await self.activePage.click(
-            selector,
-            button=button,  # type: ignore[arg-type]
-            click_count=clickCount,
-            timeout=timeoutMs or settings.defaultTimeoutMs,
-        )
-        return {"clicked": selector, "button": button, "clickCount": clickCount}
+        timeout = timeoutMs or settings.defaultTimeoutMs
+        human = humanizer.shouldHumanize(humanize)
+        if human:
+            self._cursor = await humanizer.humanClickSelector(
+                self.activePage, selector, self._cursor,
+                button=button, clickCount=clickCount, timeoutMs=timeout,
+            )
+        else:
+            await self.activePage.click(
+                selector,
+                button=button,  # type: ignore[arg-type]
+                click_count=clickCount,
+                timeout=timeout,
+            )
+        return {"clicked": selector, "button": button, "clickCount": clickCount, "humanized": human}
 
-    async def doubleClickElement(self, selector: str, timeoutMs: int | None = None) -> dict[str, Any]:
-        await self.activePage.dblclick(selector, timeout=timeoutMs or settings.defaultTimeoutMs)
-        return {"doubleClicked": selector}
+    async def doubleClickElement(
+        self, selector: str, timeoutMs: int | None = None, humanize: bool | None = None
+    ) -> dict[str, Any]:
+        timeout = timeoutMs or settings.defaultTimeoutMs
+        human = humanizer.shouldHumanize(humanize)
+        if human:
+            self._cursor = await humanizer.humanClickSelector(
+                self.activePage, selector, self._cursor, clickCount=2, timeoutMs=timeout
+            )
+        else:
+            await self.activePage.dblclick(selector, timeout=timeout)
+        return {"doubleClicked": selector, "humanized": human}
 
-    async def rightClickElement(self, selector: str, timeoutMs: int | None = None) -> dict[str, Any]:
-        await self.activePage.click(
-            selector, button="right", timeout=timeoutMs or settings.defaultTimeoutMs
-        )
-        return {"rightClicked": selector}
+    async def rightClickElement(
+        self, selector: str, timeoutMs: int | None = None, humanize: bool | None = None
+    ) -> dict[str, Any]:
+        timeout = timeoutMs or settings.defaultTimeoutMs
+        human = humanizer.shouldHumanize(humanize)
+        if human:
+            self._cursor = await humanizer.humanClickSelector(
+                self.activePage, selector, self._cursor, button="right", timeoutMs=timeout
+            )
+        else:
+            await self.activePage.click(selector, button="right", timeout=timeout)
+        return {"rightClicked": selector, "humanized": human}
 
     async def fillInput(
         self,
@@ -506,15 +576,27 @@ class PlaywrightController:
         value: str,
         clearFirst: bool = True,
         timeoutMs: int | None = None,
+        humanize: bool | None = None,
     ) -> dict[str, Any]:
         page = self.activePage
         timeout = timeoutMs or settings.defaultTimeoutMs
-        if clearFirst:
+        human = humanizer.shouldHumanize(humanize)
+        if human:
+            # Move the cursor to the field and click to focus (like a person),
+            # optionally select-all + delete to clear, then type at human speed.
+            self._cursor = await humanizer.humanClickSelector(
+                page, selector, self._cursor, timeoutMs=timeout
+            )
+            if clearFirst:
+                await page.keyboard.press("ControlOrMeta+A")
+                await page.keyboard.press("Delete")
+            await humanizer.humanType(page, value)
+        elif clearFirst:
             await page.fill(selector, value, timeout=timeout)
         else:
             await page.click(selector, timeout=timeout)
             await page.type(selector, value)
-        return {"filled": selector, "value": value}
+        return {"filled": selector, "value": value, "humanized": human}
 
     async def uploadFile(self, selector: str, filePaths: list[str]) -> dict[str, Any]:
         missing = [p for p in filePaths if not Path(p).exists()]
@@ -528,16 +610,44 @@ class PlaywrightController:
         selector: str,
         saveDir: str | None = None,
         timeoutMs: int | None = None,
+        imagesOnly: bool = True,
     ) -> dict[str, Any]:
+        """Trigger a download via *selector* and save it, safely.
+
+        Downloads can legitimately take a long time, so the wait ceiling defaults
+        to ``settings.maxDownloadWaitMs`` (an hour) rather than the short action
+        timeout. By default only **real images** are kept: the saved file's true
+        bytes are inspected and anything that is actually an executable/app/archive
+        disguised as an image (or any non-image) is deleted and reported as an
+        error — guarding against "download this image" lures that ship malware.
+        """
         page = self.activePage
-        timeout = timeoutMs or settings.defaultTimeoutMs
+        timeout = timeoutMs or settings.maxDownloadWaitMs
         async with page.expect_download(timeout=timeout) as downloadInfo:
-            await page.click(selector, timeout=timeout)
+            await page.click(selector, timeout=settings.defaultTimeoutMs)
         download = await downloadInfo.value
         targetDir = Path(saveDir) if saveDir else settings.storageDir / "downloads"
         targetDir.mkdir(parents=True, exist_ok=True)
         destination = targetDir / download.suggested_filename
         await download.save_as(str(destination))
+
+        if imagesOnly:
+            verdict = verifyImage(destination)
+            if not verdict["isImage"]:
+                try:
+                    destination.unlink()
+                except OSError:
+                    pass
+                raise ValueError(
+                    f"Refused download '{download.suggested_filename}': "
+                    f"{verdict['reason']} (only verified images are allowed)."
+                )
+            return {
+                "path": str(destination),
+                "suggestedFilename": download.suggested_filename,
+                "verifiedImage": True,
+                "format": verdict.get("format"),
+            }
         return {"path": str(destination), "suggestedFilename": download.suggested_filename}
 
     async def pressKeys(self, keys: str, selector: str | None = None) -> dict[str, Any]:
@@ -567,6 +677,82 @@ class PlaywrightController:
         )
         return {"networkIdle": True}
 
+    async def waitForStable(
+        self,
+        selector: str,
+        stableMs: int = 1200,
+        timeoutMs: int | None = None,
+        pollMs: int = 300,
+    ) -> dict[str, Any]:
+        """Wait until *selector*'s text stops changing for ``stableMs``.
+
+        This is the quiet way to wait for an online AI's streamed answer: the
+        response text grows token by token, then stops. We poll the element's
+        text length in-page and resolve once it has been unchanged for a stable
+        window — no fixed sleeps, no guessing how long generation takes. Capped by
+        ``settings.maxWaitMs`` (5 min) by default.
+        """
+        timeout = timeoutMs if timeoutMs is not None else settings.maxWaitMs
+        page = self.activePage
+        await page.locator(selector).first.wait_for(state="attached", timeout=timeout)
+        # The in-page poller resolves true once length is unchanged for stableMs.
+        result = await page.wait_for_function(
+            """([sel, stable, poll]) => new Promise((resolve) => {
+                const read = () => {
+                    const el = document.querySelector(sel);
+                    return el ? (el.innerText || el.textContent || '').length : -1;
+                };
+                let last = read();
+                let still = 0;
+                const id = setInterval(() => {
+                    const now = read();
+                    if (now === last) { still += poll; } else { still = 0; last = now; }
+                    if (still >= stable) { clearInterval(id); resolve(now); }
+                }, poll);
+            })""",
+            arg=[selector, stableMs, pollMs],
+            timeout=timeout,
+        )
+        finalLength = await result.json_value()
+        text = await page.evaluate(
+            """(sel) => { const el = document.querySelector(sel);
+                return el ? (el.innerText || el.textContent || '') : ''; }""",
+            selector,
+        )
+        return {"selector": selector, "stable": True, "length": finalLength, "text": text}
+
+    async def waitForResponse(
+        self,
+        urlPattern: str,
+        timeoutMs: int | None = None,
+    ) -> dict[str, Any]:
+        """Wait until a network response whose URL contains *urlPattern* finishes.
+
+        Reads straight from the network layer (the same stream the Network tab
+        shows): resolves when the matching request *finishes* — i.e. its
+        streaming/SSE body has fully closed — which is the moment an online AI has
+        finished answering. Capped by ``settings.maxWaitMs`` (5 min) by default.
+        """
+        timeout = timeoutMs if timeoutMs is not None else settings.maxWaitMs
+        page = self.activePage
+        response = await page.wait_for_event(
+            "response",
+            predicate=lambda r: urlPattern in r.url,
+            timeout=timeout,
+        )
+        # Await full completion of the (possibly streamed) body before returning.
+        finished = True
+        try:
+            await response.finished()
+        except Exception:  # noqa: BLE001 - body may already be consumed/closed
+            finished = False
+        return {
+            "url": response.url,
+            "status": response.status,
+            "ok": response.ok,
+            "finished": finished,
+        }
+
     # ------------------------------------------------------------------ #
     # Internal helpers
     # ------------------------------------------------------------------ #
@@ -576,8 +762,11 @@ class PlaywrightController:
             "running": self.isRunning,
             "headless": self.headless,
             "browserType": self.browserType,
+            "browserChannel": self.browserChannel,
             "persistent": True,
+            "profileName": self.profileName,
             "userDataDir": str(self.userDataDir),
+            "humanize": settings.humanize,
             "tabIndex": self._activeIndex,
             "tabCount": len(self._pages),
             "url": page.url if page else None,

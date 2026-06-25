@@ -20,7 +20,9 @@ import asyncio
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
+from app.browser import media
 from app.browser.playwright_controller import PlaywrightController
+from app.browser.profiles import getProfileManager
 from app.browser.screenshot_manager import ScreenshotManager
 from app.browser.video_recorder import VideoRecorder
 from app.utils.config import settings
@@ -38,6 +40,10 @@ class BrowserManager:
         self.controller = PlaywrightController()
         self.screenshots = ScreenshotManager()
         self.recorder = VideoRecorder()
+        self.profiles = getProfileManager()
+        # Global "no-image mode": when on, pixel screenshots are suppressed in
+        # favour of MarkItDown text. Starts from the configured default.
+        self.noImageMode: bool = settings.noImageMode
         self._lock = asyncio.Lock()
 
     # ------------------------------------------------------------------ #
@@ -63,19 +69,130 @@ class BrowserManager:
     # Lifecycle
     # ------------------------------------------------------------------ #
     async def openBrowser(self, **kwargs: Any) -> dict[str, Any]:
-        return await self._run(
-            "open_browser",
-            lambda: self.controller.launchBrowser(
+        async def op() -> dict[str, Any]:
+            profile = kwargs.get("profile")
+            resolved = self._resolveProfile(profile)
+            if resolved is None:
+                # No profile chosen and none active yet -> ask the user which to
+                # use (req 7). The driving agent surfaces this to the human.
+                return self._profileSelectionPayload()
+            name, userDataDir = resolved
+            self.profiles.setActiveProfile(name)
+            return await self.controller.launchBrowser(
                 browserType=kwargs.get("browserType", settings.browserType),
                 headless=kwargs.get("headless", settings.headless),
                 viewportWidth=kwargs.get("viewportWidth"),
                 viewportHeight=kwargs.get("viewportHeight"),
                 userAgent=kwargs.get("userAgent"),
-            ),
-        )
+                userDataDir=userDataDir,
+                profileName=name,
+                channel=kwargs.get("channel", settings.browserChannel),
+            )
+
+        return await self._run("open_browser", op)
 
     async def closeBrowser(self) -> dict[str, Any]:
         return await self._run("close_browser", self.controller.closeBrowser)
+
+    # ------------------------------------------------------------------ #
+    # Profiles (multi-account; the active one persists across chats)
+    # ------------------------------------------------------------------ #
+    def _resolveProfile(self, profile: str | None) -> tuple[str, "Path"] | None:
+        """Resolve which profile to launch.
+
+        Returns ``(name, userDataDir)`` for an explicit profile, ``"random"``, or
+        the persisted active profile. Returns ``None`` when nothing is chosen and
+        no active profile exists yet (caller should prompt the user).
+        """
+        if profile == "random":
+            name = self.profiles.chooseRandom()
+        elif profile:
+            name = profile
+        else:
+            name = self.profiles.getActiveProfile()
+            if not name:
+                return None
+        return name, self.profiles.resolveDir(name)
+
+    def _profileSelectionPayload(self) -> dict[str, Any]:
+        """Data telling the agent to ask the user which profile to use."""
+        profiles = self.profiles.listProfiles()
+        return {
+            "status": "profile_selection_required",
+            "message": (
+                "No browser profile is selected yet. Ask the user which profile to "
+                "use, or whether to choose one at random. If you have a tool to ask "
+                "the user (e.g. AskUserQuestion), use it; otherwise present these "
+                "options and wait for their reply. Then call open_browser with "
+                "profile=<name> or profile='random', or select_profile first."
+            ),
+            "profiles": profiles,
+            "options": [p["name"] for p in profiles] + ["random", "create a new one"],
+        }
+
+    async def listProfiles(self) -> dict[str, Any]:
+        return await self._run(
+            "list_profiles",
+            lambda: self._async({"profiles": self.profiles.listProfiles(),
+                                 "active": self.profiles.getActiveProfile()}),
+        )
+
+    async def selectProfile(self, name: str) -> dict[str, Any]:
+        async def op() -> dict[str, Any]:
+            chosen = self.profiles.chooseRandom() if name == "random" else name
+            info = self.profiles.setActiveProfile(chosen)
+            return {"active": info["active"], "path": info["path"]}
+
+        return await self._run("select_profile", op)
+
+    async def createProfile(self, name: str, makeActive: bool = False) -> dict[str, Any]:
+        async def op() -> dict[str, Any]:
+            info = self.profiles.createProfile(name)
+            if makeActive:
+                self.profiles.setActiveProfile(info["name"])
+            return {**info, "active": self.profiles.getActiveProfile()}
+
+        return await self._run("create_profile", op)
+
+    async def getActiveProfile(self) -> dict[str, Any]:
+        return await self._run(
+            "get_active_profile",
+            lambda: self._async({"active": self.profiles.getActiveProfile()}),
+        )
+
+    async def loginSession(self, profile: str | None = None, url: str | None = None) -> dict[str, Any]:
+        """Open a HEADED browser on a chosen/new profile for manual login/signup.
+
+        Use when a site needs a real human to log in or create an account (Google,
+        etc.) before the agent can automate it. The window is visible so the user
+        can type credentials / solve captchas; the persistent profile saves the
+        resulting session for all future automated runs.
+        """
+        async def op() -> dict[str, Any]:
+            name = self.profiles.chooseRandom() if profile == "random" else (profile or "")
+            if not name:
+                return self._profileSelectionPayload()
+            self.profiles.setActiveProfile(name)
+            if self.controller.isRunning:
+                await self.controller.closeBrowser()
+            snapshot = await self.controller.launchBrowser(
+                browserType=settings.browserType,
+                headless=False,  # must be visible for a human to act
+                userDataDir=self.profiles.resolveDir(name),
+                profileName=name,
+                channel=settings.browserChannel,
+            )
+            if url:
+                await self.controller.openUrl(url, waitUntil="domcontentloaded")
+                snapshot["url"] = url
+            snapshot["loginReady"] = True
+            snapshot["note"] = (
+                "Headed window open. The user should log in / sign up now; the "
+                "session is saved to the profile for future automated runs."
+            )
+            return snapshot
+
+        return await self._run("login_session", op)
 
     async def setHeadless(self, headless: bool) -> dict[str, Any]:
         """Switch a running browser between headless and headed (state preserved)."""
@@ -91,8 +208,17 @@ class BrowserManager:
     async def navigate(self, url: str, waitUntil: str = "networkidle", timeoutMs: int | None = None) -> dict[str, Any]:
         async def op() -> dict[str, Any]:
             if not self.controller.isRunning:
+                # Auto-launch uses the active profile if one is set, otherwise the
+                # 'default' profile — so navigate never hard-blocks. Deliberate
+                # profile selection happens via open_browser / select_profile.
+                name = self.profiles.getActiveProfile() or self.profiles.chooseRandom()
+                self.profiles.setActiveProfile(name)
                 await self.controller.launchBrowser(
-                    browserType=settings.browserType, headless=settings.headless
+                    browserType=settings.browserType,
+                    headless=settings.headless,
+                    userDataDir=self.profiles.resolveDir(name),
+                    profileName=name,
+                    channel=settings.browserChannel,
                 )
             return await self.controller.openUrl(url, waitUntil=waitUntil, timeoutMs=timeoutMs)
 
@@ -159,6 +285,7 @@ class BrowserManager:
                     selector=kwargs.get("selector"),
                     toTop=kwargs.get("toTop", False),
                     toBottom=kwargs.get("toBottom", False),
+                    humanize=kwargs.get("humanize"),
                 )
             ),
         )
@@ -166,29 +293,29 @@ class BrowserManager:
     async def hover(self, selector: str, timeoutMs: int | None = None) -> dict[str, Any]:
         return await self._run("hover", self._guard(lambda: self.controller.hoverElement(selector, timeoutMs)))
 
-    async def click(self, selector: str, button: str = "left", clickCount: int = 1, timeoutMs: int | None = None) -> dict[str, Any]:
+    async def click(self, selector: str, button: str = "left", clickCount: int = 1, timeoutMs: int | None = None, humanize: bool | None = None) -> dict[str, Any]:
         return await self._run(
             "click",
-            self._guard(lambda: self.controller.clickElement(selector, button, clickCount, timeoutMs)),
+            self._guard(lambda: self.controller.clickElement(selector, button, clickCount, timeoutMs, humanize)),
         )
 
-    async def doubleClick(self, selector: str, timeoutMs: int | None = None) -> dict[str, Any]:
-        return await self._run("double_click", self._guard(lambda: self.controller.doubleClickElement(selector, timeoutMs)))
+    async def doubleClick(self, selector: str, timeoutMs: int | None = None, humanize: bool | None = None) -> dict[str, Any]:
+        return await self._run("double_click", self._guard(lambda: self.controller.doubleClickElement(selector, timeoutMs, humanize)))
 
-    async def rightClick(self, selector: str, timeoutMs: int | None = None) -> dict[str, Any]:
-        return await self._run("right_click", self._guard(lambda: self.controller.rightClickElement(selector, timeoutMs)))
+    async def rightClick(self, selector: str, timeoutMs: int | None = None, humanize: bool | None = None) -> dict[str, Any]:
+        return await self._run("right_click", self._guard(lambda: self.controller.rightClickElement(selector, timeoutMs, humanize)))
 
-    async def fill(self, selector: str, value: str, clearFirst: bool = True, timeoutMs: int | None = None) -> dict[str, Any]:
+    async def fill(self, selector: str, value: str, clearFirst: bool = True, timeoutMs: int | None = None, humanize: bool | None = None) -> dict[str, Any]:
         return await self._run(
             "fill",
-            self._guard(lambda: self.controller.fillInput(selector, value, clearFirst, timeoutMs)),
+            self._guard(lambda: self.controller.fillInput(selector, value, clearFirst, timeoutMs, humanize)),
         )
 
     async def uploadFile(self, selector: str, filePaths: list[str]) -> dict[str, Any]:
         return await self._run("upload_file", self._guard(lambda: self.controller.uploadFile(selector, filePaths)))
 
-    async def downloadFile(self, selector: str, saveDir: str | None = None, timeoutMs: int | None = None) -> dict[str, Any]:
-        return await self._run("download_file", self._guard(lambda: self.controller.downloadFile(selector, saveDir, timeoutMs)))
+    async def downloadFile(self, selector: str, saveDir: str | None = None, timeoutMs: int | None = None, imagesOnly: bool = True) -> dict[str, Any]:
+        return await self._run("download_file", self._guard(lambda: self.controller.downloadFile(selector, saveDir, timeoutMs, imagesOnly)))
 
     async def pressKeys(self, keys: str, selector: str | None = None) -> dict[str, Any]:
         return await self._run("press_keys", self._guard(lambda: self.controller.pressKeys(keys, selector)))
@@ -202,6 +329,20 @@ class BrowserManager:
     async def waitForNetworkIdle(self, timeoutMs: int | None = None) -> dict[str, Any]:
         return await self._run("wait_for_network_idle", self._guard(lambda: self.controller.waitForNetworkIdle(timeoutMs)))
 
+    async def waitForStable(self, selector: str, stableMs: int = 1200, timeoutMs: int | None = None) -> dict[str, Any]:
+        """Wait until a selector's text stops changing (e.g. a streamed AI answer)."""
+        return await self._run(
+            "wait_for_stable",
+            self._guard(lambda: self.controller.waitForStable(selector, stableMs, timeoutMs)),
+        )
+
+    async def waitForResponse(self, urlPattern: str, timeoutMs: int | None = None) -> dict[str, Any]:
+        """Wait until a network response matching ``urlPattern`` finishes streaming."""
+        return await self._run(
+            "wait_for_response",
+            self._guard(lambda: self.controller.waitForResponse(urlPattern, timeoutMs)),
+        )
+
     # ------------------------------------------------------------------ #
     # Visual intelligence
     # ------------------------------------------------------------------ #
@@ -212,6 +353,8 @@ class BrowserManager:
         annotate: bool = False,
         label: str | None = None,
     ) -> dict[str, Any]:
+        if self.noImageMode:
+            return await self._run("take_screenshot", lambda: self._async(self._noImageNotice()))
         return await self._run(
             "take_screenshot",
             self._guard(
@@ -233,6 +376,8 @@ class BrowserManager:
         Used by the MCP ``screenshot`` tool so an AI can *see* the page inline
         without persisting anything to disk.
         """
+        if self.noImageMode:
+            return await self._run("screenshot", lambda: self._async(self._noImageNotice()))
         return await self._run(
             "screenshot",
             self._guard(
@@ -241,6 +386,38 @@ class BrowserManager:
                 )
             ),
         )
+
+    # ------------------------------------------------------------------ #
+    # No-image mode (MarkItDown) — read text instead of pixels
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _noImageNotice() -> dict[str, Any]:
+        return {
+            "noImageMode": True,
+            "note": (
+                "No-image mode is ON, so screenshots are suppressed. Use read_page "
+                "for the page's text, or to_markdown(<image/pdf/url>) to convert "
+                "media to markdown. Turn this off with set_no_image_mode(false)."
+            ),
+        }
+
+    async def setNoImageMode(self, enabled: bool) -> dict[str, Any]:
+        """Toggle global no-image mode (suppress screenshots, prefer markdown)."""
+        async def op() -> dict[str, Any]:
+            self.noImageMode = enabled
+            return {"noImageMode": enabled, "markitdownAvailable": media.markitdownAvailable()}
+
+        return await self._run("set_no_image_mode", op)
+
+    async def toMarkdown(self, source: str) -> dict[str, Any]:
+        """Convert an image/PDF/Office/HTML file or URL to markdown via MarkItDown."""
+        async def op() -> dict[str, Any]:
+            result = media.toMarkdown(source)
+            if "error" in result:
+                raise ValueError(f"{result['error']}: {result.get('details', '')}")
+            return result
+
+        return await self._run("to_markdown", op)
 
     # ------------------------------------------------------------------ #
     # Storage maintenance
@@ -329,6 +506,8 @@ class BrowserManager:
         async def op() -> dict[str, Any]:
             snapshot = self.controller._stateSnapshot()  # noqa: SLF001 - internal read
             snapshot["recording"] = self.recorder.isRecording
+            snapshot["activeProfile"] = self.profiles.getActiveProfile()
+            snapshot["noImageMode"] = self.noImageMode
             return snapshot
 
         return await self._run("status", op)
@@ -336,6 +515,11 @@ class BrowserManager:
     # ------------------------------------------------------------------ #
     # Helpers
     # ------------------------------------------------------------------ #
+    @staticmethod
+    async def _async(data: dict[str, Any]) -> dict[str, Any]:
+        """Wrap a ready value as an awaitable so it can flow through ``_run``."""
+        return data
+
     def _guard(self, coroFactory: Callable[[], Awaitable[dict[str, Any]]]) -> Callable[[], Awaitable[dict[str, Any]]]:
         """Wrap an operation so it first asserts the browser is running."""
 
