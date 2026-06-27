@@ -456,6 +456,134 @@ TOOL_SPECS: list[dict[str, Any]] = [
             "required": [],
         },
     },
+    # ------------------------------------------------------------------ #
+    # Tab intelligence
+    # ------------------------------------------------------------------ #
+    {
+        "name": "get_tabs",
+        "description": "Summarise every open tab (index, title, URL, host, which is active). Use it to keep track of many tabs.",
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+    # ------------------------------------------------------------------ #
+    # Accessibility & visual QA
+    # ------------------------------------------------------------------ #
+    {
+        "name": "get_accessibility_tree",
+        "description": "Return the page's accessibility tree (roles/names a screen reader sees) — often clearer than raw HTML for understanding structure.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "interestingOnly": {"type": "boolean", "description": "Prune presentational nodes (default true)."},
+                "root": {"type": "string", "description": "Optional CSS selector to scope the snapshot."},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "audit_page",
+        "description": "Audit the page for UI defects: horizontal overflow, hidden interactive elements, broken images, and low text contrast. Returns counts plus samples.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "sampleLimit": {"type": "integer", "description": "Max text elements the contrast pass inspects."},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "compare_screenshots",
+        "description": "Compare two screenshot files and quantify what changed: visualDifferencePercent and changedRegions with bounding boxes. Use before/after take_screenshot files.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "before": {"type": "string", "description": "Path to the baseline screenshot."},
+                "after": {"type": "string", "description": "Path to the screenshot to compare."},
+                "pixelThreshold": {"type": "integer", "description": "Per-pixel change sensitivity (0-765)."},
+                "saveDiff": {"type": "boolean", "description": "Also write a change-mask PNG and return its path."},
+            },
+            "required": ["before", "after"],
+        },
+    },
+    # ------------------------------------------------------------------ #
+    # Browser-state snapshot (cookies + storage + open tabs)
+    # ------------------------------------------------------------------ #
+    {
+        "name": "create_snapshot",
+        "description": "Capture the full browser state (cookies, localStorage, sessionStorage, open-tab URLs) to a JSON file for later restore.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "savePath": {"type": "string", "description": "Optional output path; omit to auto-name."},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "restore_snapshot",
+        "description": "Restore cookies + storage from a snapshot file made by create_snapshot (navigates to the snapshot URL first).",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Path to a snapshot JSON from create_snapshot."},
+                "navigate": {"type": "boolean", "description": "Re-open the snapshot URL before restoring storage (default true)."},
+            },
+            "required": ["path"],
+        },
+    },
+    # ------------------------------------------------------------------ #
+    # Session replay (structured, replayable action log — not video)
+    # ------------------------------------------------------------------ #
+    {
+        "name": "start_session",
+        "description": "Start recording replayable actions (click/fill/navigate/...) as structured JSON steps. Unlike start_recording (video), this is machine-replayable.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Optional session name; omit to auto-generate."},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "stop_session",
+        "description": "Stop the structured action recording and return the captured steps.",
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "save_session",
+        "description": "Save the recorded session to a JSON file for later load/replay.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Optional output path; omit to auto-name."},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "load_session",
+        "description": "Load a previously saved session JSON into memory, ready to replay.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Path to a session JSON saved by save_session."},
+            },
+            "required": ["path"],
+        },
+    },
+    {
+        "name": "replay_session",
+        "description": "Replay a recorded session's steps in order against the live browser. Loads 'path' first if given, else replays the in-memory session.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Optional session JSON to load before replaying."},
+                "delayMs": {"type": "integer", "description": "Pause between steps in milliseconds (default 500)."},
+                "continueOnError": {"type": "boolean", "description": "Keep going after a failed step (default true)."},
+            },
+            "required": [],
+        },
+    },
 ]
 
 
@@ -584,6 +712,45 @@ async def dispatchTool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         return await manager.clearNetwork()
     if name == "clear_storage":
         return await manager.clearStorage(arguments.get("kinds"))
+    if name == "get_tabs":
+        return await manager.getTabs()
+    if name == "get_accessibility_tree":
+        return await manager.getAccessibilityTree(
+            arguments.get("interestingOnly", True), arguments.get("root")
+        )
+    if name == "audit_page":
+        return await manager.auditPage(arguments.get("sampleLimit", 400))
+    if name == "compare_screenshots":
+        return await manager.compareScreenshots(
+            arguments["before"],
+            arguments["after"],
+            pixelThreshold=arguments.get("pixelThreshold", 60),
+            saveDiff=arguments.get("saveDiff", False),
+        )
+    if name == "create_snapshot":
+        return await manager.createSnapshot(savePath=arguments.get("savePath"))
+    if name == "restore_snapshot":
+        return await manager.restoreSnapshot(
+            path=arguments.get("path"),
+            snapshot=arguments.get("snapshot"),
+            navigate=arguments.get("navigate", True),
+        )
+    if name == "start_session":
+        return await manager.startSession(arguments.get("name"))
+    if name == "stop_session":
+        return await manager.stopSession()
+    if name == "get_session":
+        return await manager.getSession()
+    if name == "save_session":
+        return await manager.saveSession(arguments.get("path"))
+    if name == "load_session":
+        return await manager.loadSession(arguments["path"])
+    if name == "replay_session":
+        return await manager.replaySession(
+            path=arguments.get("path"),
+            delayMs=arguments.get("delayMs", 500),
+            continueOnError=arguments.get("continueOnError", True),
+        )
 
     logger.warning("Unknown tool requested: %s", name)
     return {

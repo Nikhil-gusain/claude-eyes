@@ -61,6 +61,117 @@ def urlMatches(pattern: str, url: str, includeQuery: bool = False) -> bool:
     return pattern in target
 
 
+# Dump localStorage + sessionStorage of the current origin into plain objects.
+_STORAGE_DUMP_JS = """() => {
+    const dump = (s) => { const o = {}; for (let i = 0; i < s.length; i++) {
+        const k = s.key(i); o[k] = s.getItem(k); } return o; };
+    let local = {}, session = {};
+    try { local = dump(localStorage); } catch (e) {}
+    try { session = dump(sessionStorage); } catch (e) {}
+    return { local, session, origin: location.origin };
+}"""
+
+# Write storage key/values back (must run on the matching origin).
+_STORAGE_RESTORE_JS = """(data) => {
+    try { for (const [k, v] of Object.entries(data.local || {})) localStorage.setItem(k, v); } catch (e) {}
+    try { for (const [k, v] of Object.entries(data.session || {})) sessionStorage.setItem(k, v); } catch (e) {}
+    return true;
+}"""
+
+# Visual-quality audit: overflow, hidden interactive elements, broken images,
+# and approximate WCAG text/background contrast. Returns counts + bounded samples.
+_AUDIT_JS = """(limit) => {
+    const out = { overflowIssues: [], hiddenButtons: [], brokenImages: [], contrastProblems: [] };
+    const CAP = 25;
+    const vw = document.documentElement.clientWidth;
+
+    if (document.documentElement.scrollWidth > vw + 1) {
+        for (const el of document.querySelectorAll('body *')) {
+            const r = el.getBoundingClientRect();
+            if (r.width > 0 && r.right > vw + 2) {
+                out.overflowIssues.push({ tag: el.tagName.toLowerCase(), id: el.id || null,
+                    overflowBy: Math.round(r.right - vw) });
+                if (out.overflowIssues.length >= CAP) break;
+            }
+        }
+    }
+
+    for (const el of document.querySelectorAll(
+        'button, a[href], input[type=button], input[type=submit], [role=button]')) {
+        const st = getComputedStyle(el);
+        const r = el.getBoundingClientRect();
+        const hidden = st.display === 'none' || st.visibility === 'hidden' ||
+            parseFloat(st.opacity) === 0 || (r.width === 0 && r.height === 0);
+        if (hidden) {
+            out.hiddenButtons.push({ tag: el.tagName.toLowerCase(),
+                text: (el.innerText || el.value || '').trim().slice(0, 80), id: el.id || null });
+            if (out.hiddenButtons.length >= CAP) break;
+        }
+    }
+
+    for (const img of document.querySelectorAll('img')) {
+        if (img.complete && img.naturalWidth === 0) {
+            out.brokenImages.push({ src: img.src, alt: img.alt || null });
+            if (out.brokenImages.length >= CAP) break;
+        }
+    }
+
+    const parseRGB = (s) => {
+        const m = s && s.match(/rgba?\\(([^)]+)\\)/);
+        if (!m) return null;
+        const p = m[1].split(',').map((x) => parseFloat(x.trim()));
+        return { r: p[0], g: p[1], b: p[2], a: p.length > 3 ? p[3] : 1 };
+    };
+    const lum = (c) => {
+        const f = (v) => { v /= 255; return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4); };
+        return 0.2126 * f(c.r) + 0.7152 * f(c.g) + 0.0722 * f(c.b);
+    };
+    const bgOf = (el) => {
+        let n = el;
+        while (n && n !== document.documentElement) {
+            const bg = parseRGB(getComputedStyle(n).backgroundColor);
+            if (bg && bg.a !== 0) return bg;
+            n = n.parentElement;
+        }
+        return { r: 255, g: 255, b: 255, a: 1 };
+    };
+    let checked = 0;
+    const els = Array.from(document.querySelectorAll(
+        'p, span, a, li, h1, h2, h3, h4, h5, h6, button, label, td, th')).slice(0, limit);
+    for (const el of els) {
+        const txt = (el.textContent || '').trim();
+        if (!txt) continue;
+        const st = getComputedStyle(el);
+        if (st.visibility === 'hidden' || st.display === 'none') continue;
+        const fg = parseRGB(st.color);
+        if (!fg) continue;
+        const ratio = (() => {
+            const l1 = lum(fg), l2 = lum(bgOf(el));
+            return (Math.max(l1, l2) + 0.05) / (Math.min(l1, l2) + 0.05);
+        })();
+        const size = parseFloat(st.fontSize);
+        const bold = (parseInt(st.fontWeight) || 400) >= 700;
+        const large = size >= 24 || (size >= 18.66 && bold);
+        const need = large ? 3 : 4.5;
+        checked++;
+        if (ratio < need) {
+            out.contrastProblems.push({ text: txt.slice(0, 60),
+                ratio: Math.round(ratio * 100) / 100, required: need, fontSize: size });
+            if (out.contrastProblems.length >= CAP) break;
+        }
+    }
+
+    return {
+        overflowIssues: out.overflowIssues.length,
+        hiddenButtons: out.hiddenButtons.length,
+        brokenImages: out.brokenImages.length,
+        contrastProblems: out.contrastProblems.length,
+        textElementsChecked: checked,
+        details: out,
+    };
+}"""
+
+
 class PlaywrightController:
     """Drives a single browser, context and its tabs."""
 
@@ -797,6 +908,119 @@ class PlaywrightController:
             "ok": response.ok,
             "finished": finished,
         }
+
+    # ------------------------------------------------------------------ #
+    # Accessibility / tab intelligence / page audit
+    # ------------------------------------------------------------------ #
+    async def getAccessibilityTree(
+        self, interestingOnly: bool = True, root: str | None = None
+    ) -> dict[str, Any]:
+        """Return the page's accessibility tree (how a screen reader sees it).
+
+        Agents often understand a page better through its accessibility tree —
+        roles, names and structure — than through raw HTML. Backed by Playwright's
+        ``aria_snapshot`` (the successor to the removed ``page.accessibility`` API),
+        which returns a compact YAML tree of roles/names and is inherently
+        interesting-only. ``root`` scopes the snapshot to one element's subtree.
+        """
+        page = self.activePage
+        if root:
+            handle = await page.query_selector(root)
+            if handle is None:
+                raise ValueError(f"Selector not found: {root}")
+        locator = page.locator(root) if root else page.locator("body")
+        tree = await locator.first.aria_snapshot()
+        nodeCount = sum(1 for line in tree.splitlines() if line.strip().startswith("-"))
+        return {
+            "tree": tree,
+            "format": "aria-yaml",
+            "nodeCount": nodeCount,
+            "root": root,
+            "interestingOnly": True,
+        }
+
+    async def getTabs(self) -> dict[str, Any]:
+        """Summarise every open tab (index, title, URL, host, which is active).
+
+        Large agents lose track of tabs; this is the one call that says what each
+        open tab actually is.
+        """
+        tabs: list[dict[str, Any]] = []
+        for index, page in enumerate(self._pages):
+            try:
+                title = await page.title()
+            except Exception:  # noqa: BLE001 - a closing/blank tab must not break the list
+                title = None
+            url = page.url
+            tabs.append(
+                {
+                    "index": index,
+                    "title": title,
+                    "url": url,
+                    "host": urlsplit(url).netloc or None,
+                    "active": index == self._activeIndex,
+                }
+            )
+        return {"tabs": tabs, "count": len(tabs), "activeIndex": self._activeIndex}
+
+    async def auditPage(self, sampleLimit: int = 400) -> dict[str, Any]:
+        """Run a visual-quality audit of the current page (no screenshot needed).
+
+        Counts (and samples) four common UI defects coding agents care about:
+        horizontal overflow, interactive elements that are hidden, broken images,
+        and low text/background contrast (approximate WCAG ratio). ``sampleLimit``
+        bounds how many text elements the contrast pass inspects.
+        """
+        return await self.activePage.evaluate(_AUDIT_JS, sampleLimit)
+
+    # ------------------------------------------------------------------ #
+    # Browser-state snapshot (cookies + storage + open tabs)
+    # ------------------------------------------------------------------ #
+    async def createSnapshot(self) -> dict[str, Any]:
+        """Capture cookies, localStorage, sessionStorage and open-tab URLs."""
+        cookies = await self._context.cookies()  # type: ignore[union-attr]
+        page = self.activePage
+        storage = await page.evaluate(_STORAGE_DUMP_JS)
+        return {
+            "cookies": cookies,
+            "localStorage": storage.get("local", {}),
+            "sessionStorage": storage.get("session", {}),
+            "origin": storage.get("origin"),
+            "tabs": [p.url for p in self._pages],
+            "activeIndex": self._activeIndex,
+            "url": page.url,
+            "capturedAt": utcTimestamp(),
+        }
+
+    async def restoreSnapshot(self, snapshot: dict[str, Any], navigate: bool = True) -> dict[str, Any]:
+        """Restore cookies + storage from *snapshot* (re-opening its URL first).
+
+        ``localStorage``/``sessionStorage`` are per-origin, so we navigate the
+        active tab to the snapshot's URL before writing them back. Cookies are
+        added context-wide regardless.
+        """
+        restored: dict[str, Any] = {
+            "cookies": 0, "localStorage": 0, "sessionStorage": 0, "navigated": False,
+        }
+        cookies = snapshot.get("cookies") or []
+        if cookies:
+            await self._context.add_cookies(cookies)  # type: ignore[union-attr]
+            restored["cookies"] = len(cookies)
+
+        url = snapshot.get("url") or next(iter(snapshot.get("tabs") or []), None)
+        page = self.activePage
+        if navigate and url and url != "about:blank":
+            await page.goto(url, wait_until="domcontentloaded")
+            restored["navigated"] = True
+
+        local = snapshot.get("localStorage") or {}
+        session = snapshot.get("sessionStorage") or {}
+        if local or session:
+            await page.evaluate(_STORAGE_RESTORE_JS, {"local": local, "session": session})
+            restored["localStorage"] = len(local)
+            restored["sessionStorage"] = len(session)
+        restored["url"] = url
+        return restored
 
     # ------------------------------------------------------------------ #
     # Internal helpers

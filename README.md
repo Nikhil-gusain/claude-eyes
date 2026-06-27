@@ -12,6 +12,12 @@ A plug-and-play browser automation layer that lets any AI agent — primarily **
 - **Safe downloads** — `download_file` keeps **verified real images only** by default: the saved bytes are inspected (magic number + full decode) and anything that is actually an executable/app/archive disguised as an image is deleted and reported as an error.
 - **No-image mode (MarkItDown)** — a global toggle (`set_no_image_mode`) that suppresses pixel screenshots in favour of text, plus a `to_markdown` tool that converts images/PDF/Office/HTML (file or URL) to markdown via Microsoft's MarkItDown.
 - **Visual intelligence / screenshots** — capture the viewport, the full scrollable page, or a single element; optional annotation with a label.
+- **Visual diff engine** — `compare_screenshots(before, after)` quantifies what changed between two captures: `visualDifferencePercent` plus `changedRegions` with bounding boxes (and an optional change-mask PNG). Turns "I took a screenshot" into "I can tell what moved".
+- **Visual QA / page audit** — `audit_page` reports common UI defects with counts + samples: horizontal overflow, hidden interactive elements, broken images, and low text/background contrast (approximate WCAG ratio) — no screenshot needed.
+- **Accessibility tree** — `get_accessibility_tree` returns the roles/names a screen reader sees, often clearer than raw HTML for understanding page structure.
+- **Tab intelligence** — `get_tabs` summarises every open tab (index, title, URL, host, which is active) so a multi-tab agent never loses track.
+- **Browser-state snapshots** — `create_snapshot` / `restore_snapshot` save and restore cookies + localStorage + sessionStorage + open-tab URLs to JSON, so a session can be resumed without re-logging-in and re-navigating.
+- **Session replay (structured action log)** — distinct from video: `start_session` records every replayable action (click/fill/navigate/...) as JSON steps; `save_session` / `load_session` / `replay_session` reproduce a bug, build a workflow, or audit what was done.
 - **Screen recording to MP4** — record a browser session and finalize it to a video file (ffmpeg-backed).
 - **MCP server** — every action is published as an MCP tool over stdio, so Claude Desktop (and any MCP client) can drive the browser directly.
 - **FastAPI + WebSocket** — a REST surface plus a persistent `/ws` socket that speaks the same action vocabulary.
@@ -241,13 +247,23 @@ Register it with Claude Desktop by adding an entry to `claude_desktop_config.jso
 
 Exposed MCP tools (snake_case, the external contract):
 
-`open_browser`, `close_browser`, `navigate`, `navigate_back`, `navigate_forward`,
-`refresh`, `open_new_tab`, `switch_tab`, `close_tab`, `get_title`, `get_url`,
-`extract_text`, `extract_links`, `extract_buttons`, `extract_forms`,
-`extract_images`, `get_dom`, `scroll`, `hover`, `click`, `double_click`,
-`right_click`, `fill`, `upload_file`, `download_file`, `press_keys`,
-`wait_for_element`, `wait_for_network_idle`, `take_screenshot`,
-`start_recording`, `stop_recording`, `status`.
+- **Lifecycle / profiles:** `open_browser`, `close_browser`, `set_headless`,
+  `clear_profile`, `list_profiles`, `select_profile`, `create_profile`,
+  `login_session`.
+- **Navigation / tabs:** `navigate`, `navigate_back`, `navigate_forward`,
+  `refresh`, `open_new_tab`, `switch_tab`, `close_tab`, `get_tabs`.
+- **Extraction / read:** `get_title`, `get_url`, `extract_text`, `extract_links`,
+  `extract_buttons`, `extract_forms`, `extract_images`, `get_dom`, `read_page`,
+  `get_accessibility_tree`, `get_network`, `clear_network`.
+- **Interaction:** `scroll`, `hover`, `click`, `double_click`, `right_click`,
+  `fill`, `upload_file`, `download_file`, `press_keys`.
+- **Waits:** `wait_for_element`, `wait_for_network_idle`, `wait_for_stable`,
+  `wait_for_response`.
+- **Visual:** `screenshot`, `take_screenshot`, `compare_screenshots`,
+  `audit_page`, `to_markdown`, `set_no_image_mode`.
+- **State / sessions:** `create_snapshot`, `restore_snapshot`, `start_session`,
+  `stop_session`, `save_session`, `load_session`, `replay_session`,
+  `start_recording`, `stop_recording`, `clear_storage`, `status`.
 
 ### Claude adapter
 
@@ -317,6 +333,9 @@ All runtime settings are resolved once at import time from `ABC_*` environment v
 | `ABC_FFMPEG` | `ffmpegBinary` | `ffmpeg` | Path to the ffmpeg binary (system dependency). |
 | `ABC_SCREENSHOT_DIR` | `screenshotDir` | `app/storage/screenshots` | Where screenshots are saved. |
 | `ABC_RECORDING_DIR` | `recordingDir` | `app/storage/recordings` | Where recordings are saved. |
+| `ABC_SESSION_DIR` | `sessionDir` | `app/storage/sessions` | Where replayable session logs are saved. |
+| `ABC_SNAPSHOT_DIR` | `snapshotDir` | `app/storage/snapshots` | Where browser-state snapshots are saved. |
+| `ABC_DIFF_DIR` | `diffDir` | `app/storage/diffs` | Where visual-diff masks are saved. |
 | `ABC_PROFILES_DIR` | `profilesDir` | `app/storage/profiles` | Root for named browser profiles. |
 | `ABC_ACTIVE_PROFILE_FILE` | `activeProfileFile` | `app/storage/active_profile.json` | Persisted active-profile pointer. |
 | `ABC_LOG_LEVEL` | `logLevel` | `INFO` | Log verbosity: `DEBUG` … `CRITICAL`. |
@@ -329,9 +348,11 @@ The `BrowserManager` facade plus the `getBrowserManager()` singleton are the del
 
 - **Multi-browser sessions** and **browser pools** (concurrent, isolated sessions).
 - **Autonomous agents** running long task loops via the adapters.
-- **Visual QA**, **accessibility audits**, and **UI regression** testing built on the screenshot/extraction primitives.
+- **AI-judgment tools** built on the deterministic primitives now in place — e.g. natural-language goal verification and element location on top of `audit_page` / `get_accessibility_tree` / `compare_screenshots`.
 - **Human-in-the-loop** approvals between agent steps.
 - **Remote / distributed execution** of the browser layer behind the same API.
+
+> Already built (see Features): **visual QA / accessibility audits** (`audit_page`, `get_accessibility_tree`), **UI regression** via `compare_screenshots`, and **session replay** via `start_session` / `replay_session`.
 
 ## License
 

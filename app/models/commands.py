@@ -171,3 +171,58 @@ class ExtractCommand(BaseModel):
         "text", "links", "buttons", "forms", "images", "dom", "title", "url"
     ]
     selector: Optional[str] = None
+
+
+class AccessibilityCommand(BaseModel):
+    """Request the page's accessibility tree, optionally scoped to a selector."""
+
+    interestingOnly: bool = True
+    root: Optional[str] = Field(default=None, description="CSS selector to scope the snapshot.")
+
+
+class AuditCommand(BaseModel):
+    """Visual-quality audit of the current page."""
+
+    sampleLimit: int = Field(default=400, ge=1, le=5000)
+
+
+class VisualDiffCommand(BaseModel):
+    """Compare two screenshot files and quantify their visual difference."""
+
+    before: str = Field(..., description="Path to the baseline screenshot.")
+    after: str = Field(..., description="Path to the screenshot to compare.")
+    pixelThreshold: int = Field(default=60, ge=0, le=765)
+    saveDiff: bool = Field(default=False, description="Also write a change-mask PNG.")
+
+
+class SnapshotCreateCommand(BaseModel):
+    """Capture cookies + storage + open tabs to a JSON snapshot."""
+
+    savePath: Optional[str] = None
+
+
+class SnapshotRestoreCommand(BaseModel):
+    """Restore a previously saved browser-state snapshot."""
+
+    path: str = Field(..., description="Path to a snapshot JSON from create_snapshot.")
+    navigate: bool = Field(default=True, description="Re-open the snapshot URL before restoring storage.")
+
+
+class SessionStartCommand(BaseModel):
+    name: Optional[str] = None
+
+
+class SessionSaveCommand(BaseModel):
+    path: Optional[str] = None
+
+
+class SessionLoadCommand(BaseModel):
+    path: str = Field(..., description="Path to a session JSON saved by save_session.")
+
+
+class ReplaySessionCommand(BaseModel):
+    """Replay a recorded session's steps against the live browser."""
+
+    path: Optional[str] = Field(default=None, description="Session JSON to load before replaying.")
+    delayMs: int = Field(default=500, ge=0, le=60_000)
+    continueOnError: bool = True

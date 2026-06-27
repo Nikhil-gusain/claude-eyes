@@ -30,6 +30,8 @@ from app import __version__
 from app.api.websocket import connectionManager, registerWebSocket
 from app.browser.browser_manager import getBrowserManager
 from app.models.commands import (
+    AccessibilityCommand,
+    AuditCommand,
     ClickCommand,
     DownloadCommand,
     ExtractCommand,
@@ -44,10 +46,17 @@ from app.models.commands import (
     ProfileCreateCommand,
     ProfileSelectCommand,
     RecordingCommand,
+    ReplaySessionCommand,
     ScreenshotCommand,
     ScrollCommand,
+    SessionLoadCommand,
+    SessionSaveCommand,
+    SessionStartCommand,
+    SnapshotCreateCommand,
+    SnapshotRestoreCommand,
     TabCommand,
     UploadCommand,
+    VisualDiffCommand,
     WaitForElementCommand,
     WaitResponseCommand,
     WaitStableCommand,
@@ -469,6 +478,89 @@ def createApp() -> FastAPI:
     async def clearStorage(kinds: list[str] | None = None) -> dict:
         logger.info("Request: clear_storage")
         return await getBrowserManager().clearStorage(kinds)
+
+    # ----------------------------------------------------------------- #
+    # Tab intelligence
+    # ----------------------------------------------------------------- #
+    @app.get("/tabs")
+    async def getTabs() -> dict:
+        logger.info("Request: get_tabs")
+        return await getBrowserManager().getTabs()
+
+    # ----------------------------------------------------------------- #
+    # Accessibility & visual QA
+    # ----------------------------------------------------------------- #
+    @app.post("/accessibility")
+    async def getAccessibilityTree(command: AccessibilityCommand) -> dict:
+        logger.info("Request: get_accessibility_tree")
+        return await getBrowserManager().getAccessibilityTree(
+            command.interestingOnly, command.root
+        )
+
+    @app.post("/audit")
+    async def auditPage(command: AuditCommand) -> dict:
+        logger.info("Request: audit_page")
+        return await getBrowserManager().auditPage(command.sampleLimit)
+
+    @app.post("/visual-diff")
+    async def compareScreenshots(command: VisualDiffCommand) -> dict:
+        logger.info("Request: compare_screenshots")
+        return await getBrowserManager().compareScreenshots(
+            command.before,
+            command.after,
+            pixelThreshold=command.pixelThreshold,
+            saveDiff=command.saveDiff,
+        )
+
+    # ----------------------------------------------------------------- #
+    # Browser-state snapshot (cookies + storage + open tabs)
+    # ----------------------------------------------------------------- #
+    @app.post("/snapshot/create")
+    async def createSnapshot(command: SnapshotCreateCommand) -> dict:
+        logger.info("Request: create_snapshot")
+        return await getBrowserManager().createSnapshot(savePath=command.savePath)
+
+    @app.post("/snapshot/restore")
+    async def restoreSnapshot(command: SnapshotRestoreCommand) -> dict:
+        logger.info("Request: restore_snapshot")
+        return await getBrowserManager().restoreSnapshot(
+            path=command.path, navigate=command.navigate
+        )
+
+    # ----------------------------------------------------------------- #
+    # Session replay (structured action log — not video)
+    # ----------------------------------------------------------------- #
+    @app.post("/session/start")
+    async def startSession(command: SessionStartCommand) -> dict:
+        logger.info("Request: start_session")
+        return await getBrowserManager().startSession(command.name)
+
+    @app.post("/session/stop")
+    async def stopSession() -> dict:
+        logger.info("Request: stop_session")
+        return await getBrowserManager().stopSession()
+
+    @app.get("/session")
+    async def getSession() -> dict:
+        logger.info("Request: get_session")
+        return await getBrowserManager().getSession()
+
+    @app.post("/session/save")
+    async def saveSession(command: SessionSaveCommand) -> dict:
+        logger.info("Request: save_session")
+        return await getBrowserManager().saveSession(command.path)
+
+    @app.post("/session/load")
+    async def loadSession(command: SessionLoadCommand) -> dict:
+        logger.info("Request: load_session")
+        return await getBrowserManager().loadSession(command.path)
+
+    @app.post("/session/replay")
+    async def replaySession(command: ReplaySessionCommand) -> dict:
+        logger.info("Request: replay_session")
+        return await getBrowserManager().replaySession(
+            path=command.path, delayMs=command.delayMs, continueOnError=command.continueOnError
+        )
 
     # ----------------------------------------------------------------- #
     # Global error handlers — no request ever returns a raw stack trace.

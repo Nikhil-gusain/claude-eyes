@@ -232,6 +232,39 @@ def _buildDispatchTable() -> dict[str, DispatchFn]:
         ),
         "clear_network": lambda manager, params: manager.clearNetwork(),
         "clear_storage": lambda manager, params: manager.clearStorage(params.get("kinds")),
+        # Tab intelligence
+        "get_tabs": lambda manager, params: manager.getTabs(),
+        # Accessibility & visual QA
+        "get_accessibility_tree": lambda manager, params: manager.getAccessibilityTree(
+            params.get("interestingOnly", True), params.get("root")
+        ),
+        "audit_page": lambda manager, params: manager.auditPage(params.get("sampleLimit", 400)),
+        "compare_screenshots": lambda manager, params: manager.compareScreenshots(
+            params["before"],
+            params["after"],
+            pixelThreshold=params.get("pixelThreshold", 60),
+            saveDiff=params.get("saveDiff", False),
+        ),
+        # Browser-state snapshot
+        "create_snapshot": lambda manager, params: manager.createSnapshot(
+            savePath=params.get("savePath")
+        ),
+        "restore_snapshot": lambda manager, params: manager.restoreSnapshot(
+            path=params.get("path"),
+            snapshot=params.get("snapshot"),
+            navigate=params.get("navigate", True),
+        ),
+        # Session replay (structured action log)
+        "start_session": lambda manager, params: manager.startSession(params.get("name")),
+        "stop_session": lambda manager, params: manager.stopSession(),
+        "get_session": lambda manager, params: manager.getSession(),
+        "save_session": lambda manager, params: manager.saveSession(params.get("path")),
+        "load_session": lambda manager, params: manager.loadSession(params["path"]),
+        "replay_session": lambda manager, params: manager.replaySession(
+            path=params.get("path"),
+            delayMs=params.get("delayMs", 500),
+            continueOnError=params.get("continueOnError", True),
+        ),
     }
 
 

@@ -47,6 +47,18 @@ class Settings:
         self.recordingDir: Path = Path(
             os.getenv("ABC_RECORDING_DIR", str(self.storageDir / "recordings"))
         )
+        # Structured-action sessions (replayable JSON), browser-state snapshots
+        # (cookies + storage + open tabs), and visual-diff outputs each get their
+        # own folder under ``storageDir`` so artifacts stay tidy and separable.
+        self.sessionDir: Path = Path(
+            os.getenv("ABC_SESSION_DIR", str(self.storageDir / "sessions"))
+        )
+        self.snapshotDir: Path = Path(
+            os.getenv("ABC_SNAPSHOT_DIR", str(self.storageDir / "snapshots"))
+        )
+        self.diffDir: Path = Path(
+            os.getenv("ABC_DIFF_DIR", str(self.storageDir / "diffs"))
+        )
         # Persistent browser profile (cookies, tokens, localStorage). Reusing one
         # directory across runs keeps the user logged into sites like Gmail. This
         # stays the *default* profile path; named multi-profiles live under
@@ -131,6 +143,9 @@ class Settings:
             "recordingFps": self.recordingFps,
             "screenshotDir": str(self.screenshotDir),
             "recordingDir": str(self.recordingDir),
+            "sessionDir": str(self.sessionDir),
+            "snapshotDir": str(self.snapshotDir),
+            "diffDir": str(self.diffDir),
             "userDataDir": str(self.userDataDir),
             "profilesDir": str(self.profilesDir),
             "apiHost": self.apiHost,

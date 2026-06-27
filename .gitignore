@@ -32,8 +32,13 @@ htmlcov/
 app/storage/screenshots/*
 app/storage/recordings/*
 app/storage/downloads/
+app/storage/sessions/*
+app/storage/snapshots/*
+app/storage/diffs/*
 !app/storage/screenshots/.gitkeep
 !app/storage/recordings/.gitkeep
+!app/storage/sessions/.gitkeep
+!app/storage/diffs/.gitkeep
 
 # --- Persistent browser profile(s): cookies/tokens/logins — NEVER commit ----
 app/storage/browser_profile/

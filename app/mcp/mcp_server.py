@@ -790,6 +790,183 @@ async def stopRecording() -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------- #
+# Tab intelligence
+# --------------------------------------------------------------------- #
+@mcp.tool(name="get_tabs")
+@safeAsync(action="get_tabs")
+async def getTabs() -> dict[str, Any]:
+    """Summarise every open tab: index, title, URL, host, and which is active.
+
+    Use this when you have several tabs open and need to remember what each one
+    is before switching — large multi-tab sessions are easy to lose track of.
+    """
+    return await getBrowserManager().getTabs()
+
+
+# --------------------------------------------------------------------- #
+# Accessibility & visual QA
+# --------------------------------------------------------------------- #
+@mcp.tool(name="get_accessibility_tree")
+@safeAsync(action="get_accessibility_tree")
+async def getAccessibilityTree(
+    interestingOnly: bool = True, root: str | None = None
+) -> dict[str, Any]:
+    """Return the page's accessibility tree (roles/names, as a screen reader sees it).
+
+    Often a better way to understand page structure than raw HTML: each node has a
+    role (button, link, heading...) and accessible name.
+
+    Args:
+        interestingOnly: Prune presentational/uninteresting nodes (default ``True``).
+        root: Optional CSS selector to scope the snapshot to one element's subtree.
+    """
+    return await getBrowserManager().getAccessibilityTree(interestingOnly, root)
+
+
+@mcp.tool(name="audit_page")
+@safeAsync(action="audit_page")
+async def auditPage(sampleLimit: int = 400) -> dict[str, Any]:
+    """Audit the current page for common UI defects (no screenshot needed).
+
+    Returns counts plus bounded samples of: horizontal ``overflowIssues``,
+    ``hiddenButtons`` (interactive elements that aren't visible), ``brokenImages``,
+    and ``contrastProblems`` (approximate WCAG text/background contrast). Useful
+    for a coding agent checking the UI it just built.
+
+    Args:
+        sampleLimit: Max number of text elements the contrast pass inspects.
+    """
+    return await getBrowserManager().auditPage(sampleLimit)
+
+
+@mcp.tool(name="compare_screenshots")
+@safeAsync(action="compare_screenshots")
+async def compareScreenshots(
+    before: str, after: str, pixelThreshold: int = 60, saveDiff: bool = False
+) -> dict[str, Any]:
+    """Compare two screenshot files and quantify what visually changed.
+
+    Returns ``visualDifferencePercent`` (share of changed pixels) and
+    ``changedRegions`` (coarse grid cells that changed, with bounding boxes).
+    Capture two ``take_screenshot`` files (e.g. before/after an action) and pass
+    their paths here to detect and locate visual changes.
+
+    Args:
+        before: Path to the baseline screenshot PNG/JPEG.
+        after: Path to the screenshot to compare against the baseline.
+        pixelThreshold: Per-pixel change sensitivity (0-765 summed channel delta).
+        saveDiff: When ``True``, also write a change-mask PNG and return its path.
+    """
+    return await getBrowserManager().compareScreenshots(
+        before, after, pixelThreshold=pixelThreshold, saveDiff=saveDiff
+    )
+
+
+# --------------------------------------------------------------------- #
+# Browser-state snapshot (cookies + storage + open tabs)
+# --------------------------------------------------------------------- #
+@mcp.tool(name="create_snapshot")
+@safeAsync(action="create_snapshot")
+async def createSnapshot(savePath: str | None = None) -> dict[str, Any]:
+    """Capture the full browser state to a JSON file: cookies, localStorage,
+    sessionStorage, and the open-tab URLs.
+
+    Restore it later with ``restore_snapshot`` to resume exactly where you left
+    off — a big time saver versus re-logging-in and re-navigating.
+
+    Args:
+        savePath: Optional path for the snapshot JSON; omit to auto-name it under
+            the server's snapshot directory.
+    """
+    return await getBrowserManager().createSnapshot(savePath=savePath)
+
+
+@mcp.tool(name="restore_snapshot")
+@safeAsync(action="restore_snapshot")
+async def restoreSnapshot(path: str, navigate: bool = True) -> dict[str, Any]:
+    """Restore cookies + storage from a snapshot file saved by ``create_snapshot``.
+
+    Because localStorage/sessionStorage are per-origin, the active tab is first
+    navigated to the snapshot's URL, then the stored keys are written back.
+
+    Args:
+        path: Path to a snapshot JSON previously written by ``create_snapshot``.
+        navigate: Re-open the snapshot's URL before restoring storage (default
+            ``True``); set ``False`` to only restore cookies.
+    """
+    return await getBrowserManager().restoreSnapshot(path=path, navigate=navigate)
+
+
+# --------------------------------------------------------------------- #
+# Session replay (structured, replayable action log — not video)
+# --------------------------------------------------------------------- #
+@mcp.tool(name="start_session")
+@safeAsync(action="start_session")
+async def startSession(name: str | None = None) -> dict[str, Any]:
+    """Start recording every replayable action (click/fill/navigate/...) as
+    structured JSON steps.
+
+    Unlike ``start_recording`` (which captures VIDEO), this captures a machine-
+    replayable log you can save, reload and ``replay_session`` later — to
+    reproduce a bug, build a workflow, or audit what was done.
+
+    Args:
+        name: Optional session name; omit to auto-generate a timestamped one.
+    """
+    return await getBrowserManager().startSession(name)
+
+
+@mcp.tool(name="stop_session")
+@safeAsync(action="stop_session")
+async def stopSession() -> dict[str, Any]:
+    """Stop the structured action recording and return the captured steps."""
+    return await getBrowserManager().stopSession()
+
+
+@mcp.tool(name="save_session")
+@safeAsync(action="save_session")
+async def saveSession(path: str | None = None) -> dict[str, Any]:
+    """Save the recorded session to a JSON file for later ``load_session``/replay.
+
+    Args:
+        path: Optional output path; omit to auto-name it under the session directory.
+    """
+    return await getBrowserManager().saveSession(path)
+
+
+@mcp.tool(name="load_session")
+@safeAsync(action="load_session")
+async def loadSession(path: str) -> dict[str, Any]:
+    """Load a previously saved session JSON into memory, ready to ``replay_session``.
+
+    Args:
+        path: Path to a session JSON saved by ``save_session``.
+    """
+    return await getBrowserManager().loadSession(path)
+
+
+@mcp.tool(name="replay_session")
+@safeAsync(action="replay_session")
+async def replaySession(
+    path: str | None = None, delayMs: int = 500, continueOnError: bool = True
+) -> dict[str, Any]:
+    """Replay a recorded session's steps in order against the live browser.
+
+    Loads ``path`` first if given, otherwise replays the in-memory session
+    (from ``start_session``/``load_session``). Returns a per-step success report.
+
+    Args:
+        path: Optional session JSON to load before replaying.
+        delayMs: Pause between steps in milliseconds (default 500).
+        continueOnError: Keep going after a failed step (default ``True``); set
+            ``False`` to stop at the first failure.
+    """
+    return await getBrowserManager().replaySession(
+        path=path, delayMs=delayMs, continueOnError=continueOnError
+    )
+
+
+# --------------------------------------------------------------------- #
 # Status
 # --------------------------------------------------------------------- #
 @mcp.tool(name="status")
