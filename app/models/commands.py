@@ -226,3 +226,70 @@ class ReplaySessionCommand(BaseModel):
     path: Optional[str] = Field(default=None, description="Session JSON to load before replaying.")
     delayMs: int = Field(default=500, ge=0, le=60_000)
     continueOnError: bool = True
+
+
+class RememberPageCommand(BaseModel):
+    """Save the current page into browser memory."""
+
+    tags: Optional[list[str]] = None
+    withScreenshot: bool = True
+
+
+class MemorySearchCommand(BaseModel):
+    query: str
+    limit: int = Field(default=10, ge=1, le=200)
+
+
+class OcrScreenshotCommand(BaseModel):
+    """OCR the current page (or an element) screenshot."""
+
+    fullPage: bool = False
+    selector: Optional[str] = None
+    lang: str = Field(default="eng", description="Tesseract language code.")
+
+
+class ReadImageCommand(BaseModel):
+    source: str = Field(..., description="Path to an image file on disk.")
+    lang: str = "eng"
+
+
+class VerifyGoalCommand(BaseModel):
+    """Judge whether a natural-language goal is met on the current page."""
+
+    goal: str
+    fullPage: bool = False
+
+
+class FindElementCommand(BaseModel):
+    description: str = Field(..., description="Natural-language description of the element.")
+    limit: int = Field(default=60, ge=1, le=300)
+
+
+class ClickByDescriptionCommand(BaseModel):
+    description: str
+    limit: int = Field(default=60, ge=1, le=300)
+    humanize: Optional[bool] = None
+
+
+class PlanActionsCommand(BaseModel):
+    goal: str
+    includeContext: bool = True
+
+
+class WorkflowCommand(BaseModel):
+    name: str = Field(..., description="Workflow name (slugified for the filename).")
+
+
+class RunWorkflowCommand(BaseModel):
+    name: str
+    delayMs: int = Field(default=500, ge=0, le=60_000)
+    continueOnError: bool = True
+
+
+class SessionCreateCommand(BaseModel):
+    sessionId: Optional[str] = None
+    makeActive: bool = True
+
+
+class SessionSwitchCommand(BaseModel):
+    sessionId: str

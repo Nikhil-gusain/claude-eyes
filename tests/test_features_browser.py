@@ -80,6 +80,30 @@ async def test_agentIntelligenceFeatures() -> None:
         assert "path" in snap["data"]
         assert "cookieCount" in snap["data"] and "tabCount" in snap["data"]
 
+        # --- Browser memory (deterministic) ----------------------------- #
+        await manager.clearMemory()
+        remembered = await manager.rememberPage(tags=["feature-test"], withScreenshot=False)
+        assert remembered["success"] is True
+        recall = await manager.searchMemory("Feature Page")
+        assert recall["success"] is True
+        assert recall["data"]["matched"] >= 1
+        await manager.clearMemory()
+
+        # --- Interactive candidates (powers AI element finding) ---------- #
+        cands = await manager.controller.getInteractiveCandidates()
+        assert cands["count"] >= 1
+        assert all("selector" in c for c in cands["candidates"])
+
+        # --- AI + OCR: present-or-graceful, but always a structured reply - #
+        vg = await manager.verifyGoal("the page shows the heading Welcome")
+        assert "success" in vg
+        if not vg["success"]:
+            assert vg.get("details")  # graceful 'unavailable' when Claude isn't set
+        ocrRes = await manager.extractTextFromScreenshot()
+        assert "success" in ocrRes
+        if not ocrRes["success"]:
+            assert ocrRes.get("details")  # graceful when Tesseract isn't installed
+
         # --- A recorded click, then stop + replay ----------------------- #
         await manager.click("#go")
         stop = await manager.stopSession()

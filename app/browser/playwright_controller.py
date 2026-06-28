@@ -172,6 +172,51 @@ _AUDIT_JS = """(limit) => {
 }"""
 
 
+# Collect visible interactive elements, each with a unique-ish CSS selector and
+# the cues an LLM needs to match a description ("blue login button").
+_CANDIDATES_JS = """(limit) => {
+    const cssPath = (el) => {
+        if (el.id) return '#' + CSS.escape(el.id);
+        const parts = [];
+        let node = el;
+        while (node && node.nodeType === 1 && node !== document.body) {
+            let sel = node.tagName.toLowerCase();
+            const parent = node.parentElement;
+            if (parent) {
+                const sibs = Array.from(parent.children).filter((c) => c.tagName === node.tagName);
+                if (sibs.length > 1) sel += ':nth-of-type(' + (sibs.indexOf(node) + 1) + ')';
+            }
+            parts.unshift(sel);
+            node = node.parentElement;
+        }
+        return parts.join(' > ');
+    };
+    const els = Array.from(document.querySelectorAll(
+        'a[href], button, input, select, textarea, [role=button], [role=link], [role=tab], [onclick]'));
+    const out = [];
+    for (const el of els) {
+        const r = el.getBoundingClientRect();
+        if (r.width === 0 && r.height === 0) continue;
+        const st = getComputedStyle(el);
+        if (st.display === 'none' || st.visibility === 'hidden') continue;
+        out.push({
+            index: out.length,
+            selector: cssPath(el),
+            tag: el.tagName.toLowerCase(),
+            type: el.getAttribute('type'),
+            text: (el.innerText || el.value || el.getAttribute('placeholder') || '').trim().slice(0, 80),
+            role: el.getAttribute('role'),
+            ariaLabel: el.getAttribute('aria-label'),
+            placeholder: el.getAttribute('placeholder'),
+            color: st.color,
+            background: st.backgroundColor,
+        });
+        if (out.length >= limit) break;
+    }
+    return out;
+}"""
+
+
 class PlaywrightController:
     """Drives a single browser, context and its tabs."""
 
@@ -972,6 +1017,16 @@ class PlaywrightController:
         bounds how many text elements the contrast pass inspects.
         """
         return await self.activePage.evaluate(_AUDIT_JS, sampleLimit)
+
+    async def getInteractiveCandidates(self, limit: int = 60) -> dict[str, Any]:
+        """List visible interactive elements with a computed CSS selector each.
+
+        Powers natural-language element finding: each candidate carries its tag,
+        visible text, role/aria-label, placeholder and computed colours plus a
+        unique ``selector`` an agent (or the AI finder) can act on directly.
+        """
+        candidates = await self.activePage.evaluate(_CANDIDATES_JS, limit)
+        return {"candidates": candidates, "count": len(candidates)}
 
     # ------------------------------------------------------------------ #
     # Browser-state snapshot (cookies + storage + open tabs)

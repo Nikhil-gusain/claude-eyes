@@ -18,11 +18,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from pathlib import Path
 from typing import Any, Awaitable, Callable
+from urllib.parse import urlsplit
 
+from app.browser import intelligence
 from app.browser import media
+from app.browser import ocr
 from app.browser import visual_diff
+from app.browser.page_memory import getPageMemory
 from app.browser.playwright_controller import PlaywrightController
 from app.browser.profiles import getProfileManager
 from app.browser.screenshot_manager import ScreenshotManager
@@ -756,6 +761,198 @@ class BrowserManager:
         }
 
     # ------------------------------------------------------------------ #
+    # Browser memory (a searchable store of pages the agent has seen)
+    # ------------------------------------------------------------------ #
+    async def rememberPage(
+        self, tags: list[str] | None = None, withScreenshot: bool = True, textLimit: int = 2000
+    ) -> dict[str, Any]:
+        """Capture the current page (title/url/structure/screenshot) into memory."""
+        async def op() -> dict[str, Any]:
+            self._requireRunning()
+            title = (await self.controller.getTitle()).get("title")
+            url = (await self.controller.getUrl()).get("url")
+            text = (await self.controller.extractText()).get("text", "")
+            links = await self.controller.extractLinks()
+            buttons = await self.controller.extractButtons()
+            forms = await self.controller.extractForms()
+            shotPath = None
+            if withScreenshot and not self.noImageMode:
+                try:
+                    shotPath = (await self.screenshots.capture(self.controller.activePage)).get("path")
+                except Exception:  # noqa: BLE001 - a screenshot is a nice-to-have here
+                    shotPath = None
+            entry = {
+                "url": url,
+                "title": title,
+                "host": urlsplit(url).netloc if url else None,
+                "summary": text[:textLimit],
+                "linkCount": links.get("count", 0),
+                "buttonCount": buttons.get("count", 0),
+                "formCount": forms.get("count", 0),
+                "screenshot": shotPath,
+                "tags": tags or [],
+            }
+            return getPageMemory().remember(entry)
+
+        return await self._run("remember_page", op)
+
+    async def searchMemory(self, query: str, limit: int = 10) -> dict[str, Any]:
+        """Recall remembered pages matching *query* (keyword ranked)."""
+        return await self._run(
+            "search_memory", lambda: self._async(getPageMemory().search(query, limit))
+        )
+
+    async def listMemory(self, limit: int = 50) -> dict[str, Any]:
+        """List the most recently remembered pages."""
+        return await self._run("list_memory", lambda: self._async(getPageMemory().list(limit)))
+
+    async def clearMemory(self) -> dict[str, Any]:
+        """Forget all remembered pages."""
+        return await self._run("clear_memory", lambda: self._async(getPageMemory().clear()))
+
+    # ------------------------------------------------------------------ #
+    # OCR (read text baked into images / screenshots)
+    # ------------------------------------------------------------------ #
+    async def extractTextFromScreenshot(
+        self, fullPage: bool = False, selector: str | None = None, lang: str = "eng"
+    ) -> dict[str, Any]:
+        """Screenshot the page (or an element) and OCR the text out of the pixels."""
+        async def op() -> dict[str, Any]:
+            self._requireRunning()
+            shot = await self.screenshots.capture(
+                self.controller.activePage, fullPage=fullPage, selector=selector
+            )
+            result = ocr.extractText(shot["path"], lang=lang)
+            if "error" in result:
+                raise ValueError(f"{result['error']}: {result.get('details', '')}")
+            result["screenshot"] = shot["path"]
+            return result
+
+        return await self._run("extract_text_from_screenshot", op)
+
+    async def readImage(self, source: str, lang: str = "eng") -> dict[str, Any]:
+        """OCR an image file on disk (no running browser required)."""
+        async def op() -> dict[str, Any]:
+            result = ocr.extractText(source, lang=lang)
+            if "error" in result:
+                raise ValueError(f"{result['error']}: {result.get('details', '')}")
+            return result
+
+        return await self._run("read_image", op)
+
+    # ------------------------------------------------------------------ #
+    # AI judgment (Claude-backed): goal check, element finding, planning
+    # ------------------------------------------------------------------ #
+    async def verifyGoal(self, goal: str, fullPage: bool = False) -> dict[str, Any]:
+        """Look at the current page and judge whether *goal* is visually met."""
+        async def op() -> dict[str, Any]:
+            self._requireRunning()
+            shot = await self.screenshots.captureBytes(self.controller.activePage, fullPage=fullPage)
+            result = intelligence.verifyGoal(goal, shot["image"])
+            if "error" in result:
+                raise ValueError(f"{result['error']}: {result.get('details', '')}")
+            return result
+
+        return await self._run("verify_goal", op)
+
+    async def findElement(self, description: str, limit: int = 60) -> dict[str, Any]:
+        """Find the element best matching a natural-language *description*."""
+        async def op() -> dict[str, Any]:
+            self._requireRunning()
+            cands = (await self.controller.getInteractiveCandidates(limit)).get("candidates", [])
+            result = intelligence.findElement(description, cands)
+            if "error" in result:
+                raise ValueError(f"{result['error']}: {result.get('details', '')}")
+            return result
+
+        return await self._run("find_element", op)
+
+    async def clickByDescription(
+        self, description: str, limit: int = 60, humanize: bool | None = None
+    ) -> dict[str, Any]:
+        """Locate an element by description and click it (find_element + click)."""
+        async def op() -> dict[str, Any]:
+            self._requireRunning()
+            cands = (await self.controller.getInteractiveCandidates(limit)).get("candidates", [])
+            found = intelligence.findElement(description, cands)
+            if "error" in found:
+                raise ValueError(f"{found['error']}: {found.get('details', '')}")
+            selector = found.get("selector")
+            if not found.get("found") or not selector:
+                return {"clicked": False, "description": description,
+                        "reason": found.get("reason"), "confidence": found.get("confidence")}
+            await self.controller.clickElement(selector, humanize=humanize)
+            return {"clicked": True, "selector": selector, "description": description,
+                    "confidence": found.get("confidence"), "reason": found.get("reason")}
+
+        return await self._run("click_by_description", op)
+
+    async def planActions(self, goal: str, includeContext: bool = True) -> dict[str, Any]:
+        """Ask Claude for an ordered action plan to achieve *goal*."""
+        async def op() -> dict[str, Any]:
+            context: dict[str, Any] | None = None
+            if includeContext and self.controller.isRunning:
+                try:
+                    context = {
+                        "url": (await self.controller.getUrl()).get("url"),
+                        "title": (await self.controller.getTitle()).get("title"),
+                        "candidates": (await self.controller.getInteractiveCandidates(30)).get("candidates", []),
+                    }
+                except Exception:  # noqa: BLE001 - context is optional
+                    context = None
+            result = intelligence.planActions(goal, context)
+            if "error" in result:
+                raise ValueError(f"{result['error']}: {result.get('details', '')}")
+            return result
+
+        return await self._run("plan_actions", op)
+
+    # ------------------------------------------------------------------ #
+    # Workflows (named, saved sessions you can re-run by name)
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _workflowPath(name: str) -> Path:
+        safe = re.sub(r"[^a-zA-Z0-9_-]+", "-", name).strip("-") or "workflow"
+        return settings.workflowDir / f"{safe}.json"
+
+    async def saveWorkflow(self, name: str) -> dict[str, Any]:
+        """Save the current recorded session as a named, re-runnable workflow."""
+        def op() -> dict[str, Any]:
+            target = self._workflowPath(name)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            result = self.session.save(str(target))
+            result["workflow"] = target.stem
+            return result
+
+        return await self._run("save_workflow", lambda: self._async(op()))
+
+    async def listWorkflows(self) -> dict[str, Any]:
+        """List saved workflows by name."""
+        def op() -> dict[str, Any]:
+            directory = Path(settings.workflowDir)
+            items = (
+                [{"name": f.stem, "path": str(f)} for f in sorted(directory.glob("*.json"))]
+                if directory.exists()
+                else []
+            )
+            return {"workflows": items, "count": len(items)}
+
+        return await self._run("list_workflows", lambda: self._async(op()))
+
+    async def runWorkflow(
+        self, name: str, delayMs: int = 500, continueOnError: bool = True
+    ) -> dict[str, Any]:
+        """Replay a previously saved workflow by name."""
+        target = self._workflowPath(name)
+        if not target.exists():
+            return buildErrorEnvelope(
+                "run_workflow", FileNotFoundError(f"No workflow named '{name}' ({target})")
+            )
+        return await self.replaySession(
+            path=str(target), delayMs=delayMs, continueOnError=continueOnError
+        )
+
+    # ------------------------------------------------------------------ #
     # Status
     # ------------------------------------------------------------------ #
     async def status(self) -> dict[str, Any]:
@@ -789,14 +986,17 @@ class BrowserManager:
 
 
 # --------------------------------------------------------------------- #
-# Process-wide singleton accessor (future: resolve per-session from a pool)
+# Per-session resolution via the session pool
 # --------------------------------------------------------------------- #
-_managerSingleton: BrowserManager | None = None
-
-
 def getBrowserManager() -> BrowserManager:
-    """Return the shared :class:`BrowserManager`, creating it on first use."""
-    global _managerSingleton
-    if _managerSingleton is None:
-        _managerSingleton = BrowserManager()
-    return _managerSingleton
+    """Return the **active session's** :class:`BrowserManager`.
+
+    Resolution now goes through :class:`~app.browser.session_pool.SessionPool`
+    (lazily importing it to avoid a cycle): with a single session this behaves
+    exactly like the old process-wide singleton, but ``create_session`` /
+    ``switch_session`` let an agent drive several isolated browsers and this
+    returns whichever one is currently active.
+    """
+    from app.browser.session_pool import getSessionPool  # noqa: PLC0415 - avoid cycle
+
+    return getSessionPool().active()

@@ -25,6 +25,12 @@ import os
 from typing import Any
 
 from app.browser.browser_manager import getBrowserManager
+from app.browser.session_pool import (
+    closeSession,
+    createSession,
+    listSessions,
+    switchSession,
+)
 from app.utils.error_handler import safeAsync
 from app.utils.logger import getLogger
 
@@ -584,6 +590,195 @@ TOOL_SPECS: list[dict[str, Any]] = [
             "required": [],
         },
     },
+    # ------------------------------------------------------------------ #
+    # Browser memory
+    # ------------------------------------------------------------------ #
+    {
+        "name": "remember_page",
+        "description": "Save the CURRENT page into memory (title, URL, structure, screenshot) so you can recall it later without re-scraping.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "tags": {"type": "array", "items": {"type": "string"}, "description": "Optional labels to attach."},
+                "withScreenshot": {"type": "boolean", "description": "Also store a screenshot (default true)."},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "search_memory",
+        "description": "Recall remembered pages matching a query (keyword-ranked). Avoids re-visiting pages you've already seen.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Words to match against remembered pages."},
+                "limit": {"type": "integer", "description": "Max matches to return (default 10)."},
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "list_memory",
+        "description": "List the most recently remembered pages.",
+        "parameters": {
+            "type": "object",
+            "properties": {"limit": {"type": "integer", "description": "Max pages to list (default 50)."}},
+            "required": [],
+        },
+    },
+    {
+        "name": "clear_memory",
+        "description": "Forget all remembered pages.",
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+    # ------------------------------------------------------------------ #
+    # OCR
+    # ------------------------------------------------------------------ #
+    {
+        "name": "extract_text_from_screenshot",
+        "description": "Screenshot the page (or an element) and OCR the text out of the pixels. For info inside images/canvas not in the DOM. Requires Tesseract.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "fullPage": {"type": "boolean", "description": "Capture the full scrollable page."},
+                "selector": {"type": "string", "description": "Optional CSS selector to OCR only that element."},
+                "lang": {"type": "string", "description": "Tesseract language code (default eng)."},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "read_image",
+        "description": "OCR a local image file and return its text. Requires Tesseract.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "source": {"type": "string", "description": "Path to an image file on disk."},
+                "lang": {"type": "string", "description": "Tesseract language code (default eng)."},
+            },
+            "required": ["source"],
+        },
+    },
+    # ------------------------------------------------------------------ #
+    # AI judgment (Claude-backed): goal check, element finding, planning
+    # ------------------------------------------------------------------ #
+    {
+        "name": "verify_goal",
+        "description": "Look at the current page and judge whether a natural-language GOAL is met. Returns {success, confidence, reason}. Self-correcting automation.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "goal": {"type": "string", "description": "The condition to check, in plain language."},
+                "fullPage": {"type": "boolean", "description": "Verify against a full-page screenshot."},
+            },
+            "required": ["goal"],
+        },
+    },
+    {
+        "name": "find_element",
+        "description": "Find the element best matching a natural-language description (e.g. 'blue login button'). Returns a usable CSS selector + confidence.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "description": {"type": "string", "description": "What the element looks like / does."},
+                "limit": {"type": "integer", "description": "Max interactive candidates to consider (default 60)."},
+            },
+            "required": ["description"],
+        },
+    },
+    {
+        "name": "click_by_description",
+        "description": "Locate an element by natural-language description and CLICK it (find_element + click).",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "description": {"type": "string", "description": "Plain-language description of the element to click."},
+                "limit": {"type": "integer", "description": "Max candidates to consider (default 60)."},
+                "humanize": {"type": "boolean", "description": "Force human-like (true) or instant (false) clicking."},
+            },
+            "required": ["description"],
+        },
+    },
+    {
+        "name": "plan_actions",
+        "description": "Ask for an ordered action PLAN to achieve a goal so you can inspect it before executing. Returns a JSON list of steps.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "goal": {"type": "string", "description": "The high-level objective to plan for."},
+                "includeContext": {"type": "boolean", "description": "Include current page context (default true)."},
+            },
+            "required": ["goal"],
+        },
+    },
+    # ------------------------------------------------------------------ #
+    # Workflows (named, saved sessions)
+    # ------------------------------------------------------------------ #
+    {
+        "name": "save_workflow",
+        "description": "Save the current recorded session as a named, re-runnable workflow (record once, run later with no AI).",
+        "parameters": {
+            "type": "object",
+            "properties": {"name": {"type": "string", "description": "A name for the workflow."}},
+            "required": ["name"],
+        },
+    },
+    {
+        "name": "run_workflow",
+        "description": "Replay a previously saved workflow by name.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "The workflow to run."},
+                "delayMs": {"type": "integer", "description": "Pause between steps (default 500)."},
+                "continueOnError": {"type": "boolean", "description": "Keep going after a failed step (default true)."},
+            },
+            "required": ["name"],
+        },
+    },
+    {
+        "name": "list_workflows",
+        "description": "List saved workflows by name.",
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+    # ------------------------------------------------------------------ #
+    # Browser sessions (pool of isolated browsers; one active at a time)
+    # ------------------------------------------------------------------ #
+    {
+        "name": "create_session",
+        "description": "Create a new, isolated browser session (own cookies/tabs/state) and make it active. Other tools act on the active session.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "sessionId": {"type": "string", "description": "Optional id; omit to auto-generate."},
+                "makeActive": {"type": "boolean", "description": "Make it active immediately (default true)."},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "list_sessions",
+        "description": "List all browser sessions (id, active flag, running, url, tab count).",
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "switch_session",
+        "description": "Make a different browser session the active one.",
+        "parameters": {
+            "type": "object",
+            "properties": {"sessionId": {"type": "string", "description": "The session id to activate."}},
+            "required": ["sessionId"],
+        },
+    },
+    {
+        "name": "close_session",
+        "description": "Close a browser session (or the active one when omitted).",
+        "parameters": {
+            "type": "object",
+            "properties": {"sessionId": {"type": "string", "description": "The session to close; omit for active."}},
+            "required": [],
+        },
+    },
 ]
 
 
@@ -751,6 +946,54 @@ async def dispatchTool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
             delayMs=arguments.get("delayMs", 500),
             continueOnError=arguments.get("continueOnError", True),
         )
+    if name == "remember_page":
+        return await manager.rememberPage(
+            tags=arguments.get("tags"), withScreenshot=arguments.get("withScreenshot", True)
+        )
+    if name == "search_memory":
+        return await manager.searchMemory(arguments["query"], limit=arguments.get("limit", 10))
+    if name == "list_memory":
+        return await manager.listMemory(limit=arguments.get("limit", 50))
+    if name == "clear_memory":
+        return await manager.clearMemory()
+    if name == "extract_text_from_screenshot":
+        return await manager.extractTextFromScreenshot(
+            fullPage=arguments.get("fullPage", False),
+            selector=arguments.get("selector"),
+            lang=arguments.get("lang", "eng"),
+        )
+    if name == "read_image":
+        return await manager.readImage(arguments["source"], lang=arguments.get("lang", "eng"))
+    if name == "verify_goal":
+        return await manager.verifyGoal(arguments["goal"], fullPage=arguments.get("fullPage", False))
+    if name == "find_element":
+        return await manager.findElement(arguments["description"], limit=arguments.get("limit", 60))
+    if name == "click_by_description":
+        return await manager.clickByDescription(
+            arguments["description"], limit=arguments.get("limit", 60),
+            humanize=arguments.get("humanize"),
+        )
+    if name == "plan_actions":
+        return await manager.planActions(
+            arguments["goal"], includeContext=arguments.get("includeContext", True)
+        )
+    if name == "save_workflow":
+        return await manager.saveWorkflow(arguments["name"])
+    if name == "run_workflow":
+        return await manager.runWorkflow(
+            arguments["name"], delayMs=arguments.get("delayMs", 500),
+            continueOnError=arguments.get("continueOnError", True),
+        )
+    if name == "list_workflows":
+        return await manager.listWorkflows()
+    if name == "create_session":
+        return createSession(arguments.get("sessionId"), makeActive=arguments.get("makeActive", True))
+    if name == "list_sessions":
+        return listSessions()
+    if name == "switch_session":
+        return switchSession(arguments["sessionId"])
+    if name == "close_session":
+        return await closeSession(arguments.get("sessionId"))
 
     logger.warning("Unknown tool requested: %s", name)
     return {

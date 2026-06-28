@@ -22,6 +22,12 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP, Image
 
 from app.browser.browser_manager import getBrowserManager
+from app.browser.session_pool import (
+    closeSession,
+    createSession,
+    listSessions,
+    switchSession,
+)
 from app.utils.config import settings
 from app.utils.error_handler import safeAsync
 from app.utils.logger import getLogger
@@ -964,6 +970,242 @@ async def replaySession(
     return await getBrowserManager().replaySession(
         path=path, delayMs=delayMs, continueOnError=continueOnError
     )
+
+
+# --------------------------------------------------------------------- #
+# Browser memory (searchable store of pages the agent has seen)
+# --------------------------------------------------------------------- #
+@mcp.tool(name="remember_page")
+@safeAsync(action="remember_page")
+async def rememberPage(
+    tags: list[str] | None = None, withScreenshot: bool = True
+) -> dict[str, Any]:
+    """Save the CURRENT page into memory so you can recall it later without
+    re-scraping (title, URL, structure, and a screenshot).
+
+    Args:
+        tags: Optional labels to attach (e.g. ``["pricing", "competitor"]``).
+        withScreenshot: Also store a screenshot of the page (default ``True``).
+    """
+    return await getBrowserManager().rememberPage(tags=tags, withScreenshot=withScreenshot)
+
+
+@mcp.tool(name="search_memory")
+@safeAsync(action="search_memory")
+async def searchMemory(query: str, limit: int = 10) -> dict[str, Any]:
+    """Recall remembered pages matching a query (keyword-ranked).
+
+    Avoids re-visiting a page you've already seen — e.g. ``search_memory("pricing
+    page")`` returns the stored record (URL, title, structure, screenshot path).
+
+    Args:
+        query: Words to match against remembered titles/URLs/text/tags.
+        limit: Maximum number of matches to return (default 10).
+    """
+    return await getBrowserManager().searchMemory(query, limit=limit)
+
+
+@mcp.tool(name="list_memory")
+@safeAsync(action="list_memory")
+async def listMemory(limit: int = 50) -> dict[str, Any]:
+    """List the most recently remembered pages."""
+    return await getBrowserManager().listMemory(limit=limit)
+
+
+@mcp.tool(name="clear_memory")
+@safeAsync(action="clear_memory")
+async def clearMemory() -> dict[str, Any]:
+    """Forget all remembered pages (clears the memory store)."""
+    return await getBrowserManager().clearMemory()
+
+
+# --------------------------------------------------------------------- #
+# OCR (read text baked into images / screenshots)
+# --------------------------------------------------------------------- #
+@mcp.tool(name="extract_text_from_screenshot")
+@safeAsync(action="extract_text_from_screenshot")
+async def extractTextFromScreenshot(
+    fullPage: bool = False, selector: str | None = None, lang: str = "eng"
+) -> dict[str, Any]:
+    """Screenshot the page (or an element) and OCR the text out of the pixels.
+
+    Use for information that lives inside images/canvas and isn't in the DOM.
+    Requires Tesseract (``pytesseract`` + the ``tesseract`` binary); if missing,
+    a clear error with install hints is returned.
+
+    Args:
+        fullPage: Capture the full scrollable page before OCR.
+        selector: Optional CSS selector to OCR only that element.
+        lang: Tesseract language code (default ``eng``).
+    """
+    return await getBrowserManager().extractTextFromScreenshot(
+        fullPage=fullPage, selector=selector, lang=lang
+    )
+
+
+@mcp.tool(name="read_image")
+@safeAsync(action="read_image")
+async def readImage(source: str, lang: str = "eng") -> dict[str, Any]:
+    """OCR a local image file and return its text.
+
+    Args:
+        source: Path to an image file on disk.
+        lang: Tesseract language code (default ``eng``).
+    """
+    return await getBrowserManager().readImage(source, lang=lang)
+
+
+# --------------------------------------------------------------------- #
+# AI judgment (Claude-backed): goal check, element finding, planning
+# --------------------------------------------------------------------- #
+@mcp.tool(name="verify_goal")
+@safeAsync(action="verify_goal")
+async def verifyGoal(goal: str, fullPage: bool = False) -> dict[str, Any]:
+    """Look at the current page and judge whether a natural-language GOAL is met.
+
+    Turns automation into self-correcting automation: e.g.
+    ``verify_goal("the submit button is visible above the fold")`` returns
+    ``{success, confidence, reason}``. Needs the ``anthropic`` SDK and
+    ANTHROPIC_API_KEY; otherwise returns a clear unavailable error.
+
+    Args:
+        goal: The condition to check, in plain language.
+        fullPage: Verify against a full-page screenshot rather than the viewport.
+    """
+    return await getBrowserManager().verifyGoal(goal, fullPage=fullPage)
+
+
+@mcp.tool(name="find_element")
+@safeAsync(action="find_element")
+async def findElement(description: str, limit: int = 60) -> dict[str, Any]:
+    """Find the element best matching a natural-language description.
+
+    e.g. ``find_element("blue login button")`` returns a usable CSS ``selector``
+    plus confidence/reason — robust to markup you don't know in advance. Needs
+    Claude (SDK + ANTHROPIC_API_KEY).
+
+    Args:
+        description: What the element looks like / does, in plain language.
+        limit: Max interactive candidates to consider (default 60).
+    """
+    return await getBrowserManager().findElement(description, limit=limit)
+
+
+@mcp.tool(name="click_by_description")
+@safeAsync(action="click_by_description")
+async def clickByDescription(
+    description: str, limit: int = 60, humanize: bool | None = None
+) -> dict[str, Any]:
+    """Locate an element by description and CLICK it (find_element + click).
+
+    e.g. ``click_by_description("the accept cookies button")``. Needs Claude.
+
+    Args:
+        description: Plain-language description of the element to click.
+        limit: Max interactive candidates to consider (default 60).
+        humanize: Force human-like (``True``) or instant (``False``) clicking.
+    """
+    return await getBrowserManager().clickByDescription(description, limit=limit, humanize=humanize)
+
+
+@mcp.tool(name="plan_actions")
+@safeAsync(action="plan_actions")
+async def planActions(goal: str, includeContext: bool = True) -> dict[str, Any]:
+    """Ask Claude for an ordered action PLAN to achieve a goal (inspect before run).
+
+    Returns a JSON list of steps (action/target/value/why) so you can review the
+    approach before executing. Needs Claude (SDK + ANTHROPIC_API_KEY).
+
+    Args:
+        goal: The high-level objective to plan for.
+        includeContext: Include the current page's URL/title/elements as context.
+    """
+    return await getBrowserManager().planActions(goal, includeContext=includeContext)
+
+
+# --------------------------------------------------------------------- #
+# Workflows (named, saved sessions you can re-run by name)
+# --------------------------------------------------------------------- #
+@mcp.tool(name="save_workflow")
+@safeAsync(action="save_workflow")
+async def saveWorkflow(name: str) -> dict[str, Any]:
+    """Save the current recorded session as a named, re-runnable workflow.
+
+    Record a successful sequence with ``start_session``/``stop_session``, then
+    save it here; later ``run_workflow(name)`` repeats it with no AI needed.
+
+    Args:
+        name: A name for the workflow (slugified for the filename).
+    """
+    return await getBrowserManager().saveWorkflow(name)
+
+
+@mcp.tool(name="run_workflow")
+@safeAsync(action="run_workflow")
+async def runWorkflow(name: str, delayMs: int = 500, continueOnError: bool = True) -> dict[str, Any]:
+    """Replay a previously saved workflow by name.
+
+    Args:
+        name: The workflow to run (as saved by ``save_workflow``).
+        delayMs: Pause between steps in milliseconds (default 500).
+        continueOnError: Keep going after a failed step (default ``True``).
+    """
+    return await getBrowserManager().runWorkflow(name, delayMs=delayMs, continueOnError=continueOnError)
+
+
+@mcp.tool(name="list_workflows")
+@safeAsync(action="list_workflows")
+async def listWorkflows() -> dict[str, Any]:
+    """List saved workflows by name."""
+    return await getBrowserManager().listWorkflows()
+
+
+# --------------------------------------------------------------------- #
+# Browser sessions (a pool of isolated browsers; one active at a time)
+# --------------------------------------------------------------------- #
+@mcp.tool(name="create_session")
+@safeAsync(action="create_session")
+async def createSessionTool(sessionId: str | None = None, makeActive: bool = True) -> dict[str, Any]:
+    """Create a new, isolated browser session and (by default) make it active.
+
+    Each session is its own independent browser (own cookies/tabs/state). All
+    other tools act on the ACTIVE session; use ``switch_session`` to move between
+    them — handy for driving several sites/accounts at once.
+
+    Args:
+        sessionId: Optional id for the session; omit to auto-generate one.
+        makeActive: Make the new session active immediately (default ``True``).
+    """
+    return createSession(sessionId, makeActive=makeActive)
+
+
+@mcp.tool(name="list_sessions")
+@safeAsync(action="list_sessions")
+async def listSessionsTool() -> dict[str, Any]:
+    """List all browser sessions (id, active flag, running, url, tab count)."""
+    return listSessions()
+
+
+@mcp.tool(name="switch_session")
+@safeAsync(action="switch_session")
+async def switchSessionTool(sessionId: str) -> dict[str, Any]:
+    """Make a different browser session the active one.
+
+    Args:
+        sessionId: The id of the session to activate.
+    """
+    return switchSession(sessionId)
+
+
+@mcp.tool(name="close_session")
+@safeAsync(action="close_session")
+async def closeSessionTool(sessionId: str | None = None) -> dict[str, Any]:
+    """Close a browser session and free it, or the active one when omitted.
+
+    Args:
+        sessionId: The session to close; omit to close the active session.
+    """
+    return await closeSession(sessionId)
 
 
 # --------------------------------------------------------------------- #

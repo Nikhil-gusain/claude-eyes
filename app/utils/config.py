@@ -59,6 +59,17 @@ class Settings:
         self.diffDir: Path = Path(
             os.getenv("ABC_DIFF_DIR", str(self.storageDir / "diffs"))
         )
+        # Page memory (a small searchable store of pages the agent has seen) and
+        # named workflows (saved sessions runnable by name).
+        self.memoryDir: Path = Path(
+            os.getenv("ABC_MEMORY_DIR", str(self.storageDir / "memory"))
+        )
+        self.memoryFile: Path = Path(
+            os.getenv("ABC_MEMORY_FILE", str(self.storageDir / "memory" / "pages.json"))
+        )
+        self.workflowDir: Path = Path(
+            os.getenv("ABC_WORKFLOW_DIR", str(self.storageDir / "workflows"))
+        )
         # Persistent browser profile (cookies, tokens, localStorage). Reusing one
         # directory across runs keeps the user logged into sites like Gmail. This
         # stays the *default* profile path; named multi-profiles live under
@@ -122,6 +133,11 @@ class Settings:
         self.apiHost: str = os.getenv("ABC_HOST", "127.0.0.1")
         self.apiPort: int = _envInt("ABC_PORT", 8000)
 
+        # ----- AI intelligence (vision goal-checks, element finding, planning) --
+        # Model used by the in-process "smart" tools that call Claude. Falls back
+        # to a clear error envelope when the SDK or ANTHROPIC_API_KEY is absent.
+        self.aiModel: str = os.getenv("ABC_AI_MODEL", "claude-opus-4-8")
+
         # ----- Logging ------------------------------------------------------
         self.logLevel: str = os.getenv("ABC_LOG_LEVEL", "INFO").upper()
 
@@ -146,6 +162,8 @@ class Settings:
             "sessionDir": str(self.sessionDir),
             "snapshotDir": str(self.snapshotDir),
             "diffDir": str(self.diffDir),
+            "memoryDir": str(self.memoryDir),
+            "workflowDir": str(self.workflowDir),
             "userDataDir": str(self.userDataDir),
             "profilesDir": str(self.profilesDir),
             "apiHost": self.apiHost,

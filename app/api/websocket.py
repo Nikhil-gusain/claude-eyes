@@ -20,6 +20,12 @@ from typing import Any, Awaitable, Callable
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from app.browser.browser_manager import BrowserManager, getBrowserManager
+from app.browser.session_pool import (
+    closeSession,
+    createSession,
+    listSessions,
+    switchSession,
+)
 from app.utils.helpers import errorResponse
 from app.utils.logger import getLogger
 
@@ -105,6 +111,16 @@ connectionManager = ConnectionManager()
 # single table means both the WebSocket loop and any future caller share one
 # authoritative mapping from the tool vocabulary to manager methods.
 DispatchFn = Callable[[BrowserManager, dict[str, Any]], Awaitable[dict[str, Any]]]
+
+
+async def _async(value: dict[str, Any]) -> dict[str, Any]:
+    """Wrap an already-computed envelope as an awaitable for the dispatch table.
+
+    The session-pool helpers are synchronous (they return a ready envelope); the
+    dispatch table expects every handler to return an awaitable, so they pass
+    through here.
+    """
+    return value
 
 
 def _buildDispatchTable() -> dict[str, DispatchFn]:
@@ -265,6 +281,52 @@ def _buildDispatchTable() -> dict[str, DispatchFn]:
             delayMs=params.get("delayMs", 500),
             continueOnError=params.get("continueOnError", True),
         ),
+        # Browser memory
+        "remember_page": lambda manager, params: manager.rememberPage(
+            tags=params.get("tags"), withScreenshot=params.get("withScreenshot", True)
+        ),
+        "search_memory": lambda manager, params: manager.searchMemory(
+            params["query"], limit=params.get("limit", 10)
+        ),
+        "list_memory": lambda manager, params: manager.listMemory(limit=params.get("limit", 50)),
+        "clear_memory": lambda manager, params: manager.clearMemory(),
+        # OCR
+        "extract_text_from_screenshot": lambda manager, params: manager.extractTextFromScreenshot(
+            fullPage=params.get("fullPage", False),
+            selector=params.get("selector"),
+            lang=params.get("lang", "eng"),
+        ),
+        "read_image": lambda manager, params: manager.readImage(
+            params["source"], lang=params.get("lang", "eng")
+        ),
+        # AI judgment (Claude-backed)
+        "verify_goal": lambda manager, params: manager.verifyGoal(
+            params["goal"], fullPage=params.get("fullPage", False)
+        ),
+        "find_element": lambda manager, params: manager.findElement(
+            params["description"], limit=params.get("limit", 60)
+        ),
+        "click_by_description": lambda manager, params: manager.clickByDescription(
+            params["description"], limit=params.get("limit", 60), humanize=params.get("humanize")
+        ),
+        "plan_actions": lambda manager, params: manager.planActions(
+            params["goal"], includeContext=params.get("includeContext", True)
+        ),
+        # Workflows
+        "save_workflow": lambda manager, params: manager.saveWorkflow(params["name"]),
+        "run_workflow": lambda manager, params: manager.runWorkflow(
+            params["name"],
+            delayMs=params.get("delayMs", 500),
+            continueOnError=params.get("continueOnError", True),
+        ),
+        "list_workflows": lambda manager, params: manager.listWorkflows(),
+        # Browser sessions (pool) — these act on the pool, not a single manager.
+        "create_session": lambda manager, params: _async(
+            createSession(params.get("sessionId"), makeActive=params.get("makeActive", True))
+        ),
+        "list_sessions": lambda manager, params: _async(listSessions()),
+        "switch_session": lambda manager, params: _async(switchSession(params["sessionId"])),
+        "close_session": lambda manager, params: closeSession(params.get("sessionId")),
     }
 
 

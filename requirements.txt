@@ -45,6 +45,12 @@ openai>=1.30             # OpenAI adapter
 # MissingDependency). `set_no_image_mode`/`to_markdown` report which formats work.
 markitdown[pdf,docx,pptx,xlsx]>=0.0.1  # image/PDF/Office -> markdown (no-image mode)
 
+# ----- OCR (read text baked into images/screenshots) -----
+# Optional at runtime: `extract_text_from_screenshot` / `read_image` degrade to a
+# clear error if missing. Needs BOTH this package AND the system Tesseract binary
+# (e.g. `brew install tesseract` / `apt-get install tesseract-ocr`).
+pytesseract>=0.3.10  # optional OCR engine wrapper
+
 # ----- test -----
 pytest>=8.0              # test runner
 pytest-asyncio>=0.23     # async test support (asyncio_mode=auto, see pyproject.toml)

@@ -18,6 +18,11 @@ A plug-and-play browser automation layer that lets any AI agent — primarily **
 - **Tab intelligence** — `get_tabs` summarises every open tab (index, title, URL, host, which is active) so a multi-tab agent never loses track.
 - **Browser-state snapshots** — `create_snapshot` / `restore_snapshot` save and restore cookies + localStorage + sessionStorage + open-tab URLs to JSON, so a session can be resumed without re-logging-in and re-navigating.
 - **Session replay (structured action log)** — distinct from video: `start_session` records every replayable action (click/fill/navigate/...) as JSON steps; `save_session` / `load_session` / `replay_session` reproduce a bug, build a workflow, or audit what was done.
+- **Named workflows** — `save_workflow` / `run_workflow` / `list_workflows` save a recorded session under a name and replay it later by name — no AI needed, fast and deterministic.
+- **AI judgment (Claude-backed)** — turns automation into *self-correcting* automation: `verify_goal` looks at a screenshot and judges whether a plain-language goal is met (`{success, confidence, reason}`); `find_element` / `click_by_description` locate an element from a description like "blue login button"; `plan_actions` returns an inspectable step plan. Needs the `anthropic` SDK + `ANTHROPIC_API_KEY`; degrades to a clear "unavailable" error otherwise.
+- **Browser memory** — `remember_page` stores a page's title/URL/structure/screenshot; `search_memory` recalls it later by keyword so the agent avoids re-scraping pages it has already seen.
+- **OCR** — `extract_text_from_screenshot` / `read_image` read text baked into images/canvas via Tesseract (optional dependency; honest error with install hints when absent).
+- **Browser session pool** — `create_session` / `list_sessions` / `switch_session` / `close_session` run several isolated browsers (own cookies/tabs/state) with one active at a time; every other tool drives the active session.
 - **Screen recording to MP4** — record a browser session and finalize it to a video file (ffmpeg-backed).
 - **MCP server** — every action is published as an MCP tool over stdio, so Claude Desktop (and any MCP client) can drive the browser directly.
 - **FastAPI + WebSocket** — a REST surface plus a persistent `/ws` socket that speaks the same action vocabulary.
@@ -55,7 +60,13 @@ Module map:
 | `app/browser/media.py` | `verifyImage` (download safety) and `toMarkdown` (MarkItDown, no-image mode). |
 | `app/browser/screenshot_manager.py` | Capture and save screenshots (viewport / full page / element / annotated). |
 | `app/browser/video_recorder.py` | Start/stop session recording and finalize the MP4 (ffmpeg). |
-| `app/browser/browser_manager.py` | **Facade** the API, MCP, and adapters all call. Wraps every action in the AI-friendly envelope and serializes access behind an `asyncio.Lock`. Exposes `getBrowserManager()` singleton. |
+| `app/browser/session_recorder.py` | `SessionRecorder` — structured, replayable action log (save/load/replay). |
+| `app/browser/visual_diff.py` | Pixel diff of two screenshots (% changed + changed regions). |
+| `app/browser/page_memory.py` | `PageMemory` — searchable store of pages the agent has seen (`getPageMemory()`). |
+| `app/browser/ocr.py` | Optional Tesseract OCR for text inside images/screenshots (graceful when absent). |
+| `app/browser/intelligence.py` | Claude-backed goal verification / element finding / planning (graceful when absent). |
+| `app/browser/session_pool.py` | `SessionPool` — many isolated browsers, one active; backs `getBrowserManager()`. |
+| `app/browser/browser_manager.py` | **Facade** the API, MCP, and adapters all call. Wraps every action in the AI-friendly envelope and serializes access behind an `asyncio.Lock`. `getBrowserManager()` resolves the active session from the pool. |
 | `app/api/server.py` | FastAPI app + REST routes; exposes `app` and `runServer()`. |
 | `app/api/websocket.py` | `/ws` WebSocket route speaking `{"action", "params"}`. |
 | `app/agents/claude_adapter.py` | `ClaudeAdapter` — builds tools and runs a Claude conversation loop. |
@@ -261,9 +272,16 @@ Exposed MCP tools (snake_case, the external contract):
   `wait_for_response`.
 - **Visual:** `screenshot`, `take_screenshot`, `compare_screenshots`,
   `audit_page`, `to_markdown`, `set_no_image_mode`.
+- **AI judgment (Claude):** `verify_goal`, `find_element`,
+  `click_by_description`, `plan_actions`.
+- **OCR:** `extract_text_from_screenshot`, `read_image`.
+- **Memory:** `remember_page`, `search_memory`, `list_memory`, `clear_memory`.
 - **State / sessions:** `create_snapshot`, `restore_snapshot`, `start_session`,
   `stop_session`, `save_session`, `load_session`, `replay_session`,
+  `save_workflow`, `run_workflow`, `list_workflows`,
   `start_recording`, `stop_recording`, `clear_storage`, `status`.
+- **Browser pool:** `create_session`, `list_sessions`, `switch_session`,
+  `close_session`.
 
 ### Claude adapter
 
@@ -336,6 +354,9 @@ All runtime settings are resolved once at import time from `ABC_*` environment v
 | `ABC_SESSION_DIR` | `sessionDir` | `app/storage/sessions` | Where replayable session logs are saved. |
 | `ABC_SNAPSHOT_DIR` | `snapshotDir` | `app/storage/snapshots` | Where browser-state snapshots are saved. |
 | `ABC_DIFF_DIR` | `diffDir` | `app/storage/diffs` | Where visual-diff masks are saved. |
+| `ABC_MEMORY_DIR` / `ABC_MEMORY_FILE` | `memoryDir` / `memoryFile` | `app/storage/memory` | Browser-memory store location. |
+| `ABC_WORKFLOW_DIR` | `workflowDir` | `app/storage/workflows` | Where named workflows are saved. |
+| `ABC_AI_MODEL` | `aiModel` | `claude-opus-4-8` | Claude model for verify_goal / find_element / plan_actions. |
 | `ABC_PROFILES_DIR` | `profilesDir` | `app/storage/profiles` | Root for named browser profiles. |
 | `ABC_ACTIVE_PROFILE_FILE` | `activeProfileFile` | `app/storage/active_profile.json` | Persisted active-profile pointer. |
 | `ABC_LOG_LEVEL` | `logLevel` | `INFO` | Log verbosity: `DEBUG` … `CRITICAL`. |
@@ -346,13 +367,12 @@ Run `python start.py info` to print the resolved settings and storage paths.
 
 The `BrowserManager` facade plus the `getBrowserManager()` singleton are the deliberate **seam** for scaling out — today it returns one process-wide manager, but a `BrowserPool` keyed by session id could resolve a manager per session without changing any caller. That single seam opens the door to:
 
-- **Multi-browser sessions** and **browser pools** (concurrent, isolated sessions).
 - **Autonomous agents** running long task loops via the adapters.
-- **AI-judgment tools** built on the deterministic primitives now in place — e.g. natural-language goal verification and element location on top of `audit_page` / `get_accessibility_tree` / `compare_screenshots`.
 - **Human-in-the-loop** approvals between agent steps.
 - **Remote / distributed execution** of the browser layer behind the same API.
+- **True concurrent sessions** — the pool runs many isolated browsers but drives one *active* at a time; per-session parallel execution (rather than switch-then-act) is the next step.
 
-> Already built (see Features): **visual QA / accessibility audits** (`audit_page`, `get_accessibility_tree`), **UI regression** via `compare_screenshots`, and **session replay** via `start_session` / `replay_session`.
+> Already built (see Features): **browser session pool** (`create_session`/`switch_session`), **AI judgment** (`verify_goal`, `find_element`, `plan_actions`), **browser memory**, **OCR**, **named workflows**, **visual QA / accessibility audits** (`audit_page`, `get_accessibility_tree`), **UI regression** via `compare_screenshots`, and **session replay** via `start_session` / `replay_session`.
 
 ## License
 

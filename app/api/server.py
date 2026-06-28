@@ -29,37 +29,55 @@ from fastapi.staticfiles import StaticFiles
 from app import __version__
 from app.api.websocket import connectionManager, registerWebSocket
 from app.browser.browser_manager import getBrowserManager
+from app.browser.session_pool import (
+    closeSession,
+    createSession,
+    listSessions,
+    switchSession,
+)
 from app.models.commands import (
     AccessibilityCommand,
     AuditCommand,
+    ClickByDescriptionCommand,
     ClickCommand,
     DownloadCommand,
     ExtractCommand,
     FillCommand,
+    FindElementCommand,
     HoverCommand,
     LaunchCommand,
     LoginSessionCommand,
     MarkdownCommand,
+    MemorySearchCommand,
     NavigateCommand,
     NoImageModeCommand,
+    OcrScreenshotCommand,
+    PlanActionsCommand,
     PressKeysCommand,
     ProfileCreateCommand,
     ProfileSelectCommand,
+    ReadImageCommand,
     RecordingCommand,
+    RememberPageCommand,
     ReplaySessionCommand,
+    RunWorkflowCommand,
     ScreenshotCommand,
     ScrollCommand,
+    SessionCreateCommand,
     SessionLoadCommand,
     SessionSaveCommand,
     SessionStartCommand,
+    SessionSwitchCommand,
     SnapshotCreateCommand,
     SnapshotRestoreCommand,
     TabCommand,
     UploadCommand,
+    VerifyGoalCommand,
     VisualDiffCommand,
     WaitForElementCommand,
     WaitResponseCommand,
     WaitStableCommand,
+    WorkflowCommand,
 )
 from app.utils.config import settings
 from app.utils.helpers import ensureDir, errorResponse
@@ -88,10 +106,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         yield
     finally:
         try:
-            await getBrowserManager().closeBrowser()
-            logger.info("Browser closed on shutdown")
+            from app.browser.session_pool import getSessionPool
+
+            closed = await getSessionPool().closeAll()
+            logger.info("Closed %d browser session(s) on shutdown", closed)
         except Exception:  # noqa: BLE001 - shutdown must never raise
-            logger.exception("Failed to close browser on shutdown")
+            logger.exception("Failed to close browser sessions on shutdown")
 
 
 def createApp() -> FastAPI:
@@ -561,6 +581,117 @@ def createApp() -> FastAPI:
         return await getBrowserManager().replaySession(
             path=command.path, delayMs=command.delayMs, continueOnError=command.continueOnError
         )
+
+    # ----------------------------------------------------------------- #
+    # Browser memory
+    # ----------------------------------------------------------------- #
+    @app.post("/memory/remember")
+    async def rememberPage(command: RememberPageCommand) -> dict:
+        logger.info("Request: remember_page")
+        return await getBrowserManager().rememberPage(
+            tags=command.tags, withScreenshot=command.withScreenshot
+        )
+
+    @app.post("/memory/search")
+    async def searchMemory(command: MemorySearchCommand) -> dict:
+        logger.info("Request: search_memory -> %s", command.query)
+        return await getBrowserManager().searchMemory(command.query, limit=command.limit)
+
+    @app.get("/memory")
+    async def listMemory(limit: int = 50) -> dict:
+        logger.info("Request: list_memory")
+        return await getBrowserManager().listMemory(limit=limit)
+
+    @app.post("/memory/clear")
+    async def clearMemory() -> dict:
+        logger.info("Request: clear_memory")
+        return await getBrowserManager().clearMemory()
+
+    # ----------------------------------------------------------------- #
+    # OCR
+    # ----------------------------------------------------------------- #
+    @app.post("/ocr/screenshot")
+    async def extractTextFromScreenshot(command: OcrScreenshotCommand) -> dict:
+        logger.info("Request: extract_text_from_screenshot")
+        return await getBrowserManager().extractTextFromScreenshot(
+            fullPage=command.fullPage, selector=command.selector, lang=command.lang
+        )
+
+    @app.post("/ocr/image")
+    async def readImage(command: ReadImageCommand) -> dict:
+        logger.info("Request: read_image -> %s", command.source)
+        return await getBrowserManager().readImage(command.source, lang=command.lang)
+
+    # ----------------------------------------------------------------- #
+    # AI judgment (Claude-backed)
+    # ----------------------------------------------------------------- #
+    @app.post("/ai/verify-goal")
+    async def verifyGoal(command: VerifyGoalCommand) -> dict:
+        logger.info("Request: verify_goal")
+        return await getBrowserManager().verifyGoal(command.goal, fullPage=command.fullPage)
+
+    @app.post("/ai/find-element")
+    async def findElement(command: FindElementCommand) -> dict:
+        logger.info("Request: find_element -> %s", command.description)
+        return await getBrowserManager().findElement(command.description, limit=command.limit)
+
+    @app.post("/ai/click-by-description")
+    async def clickByDescription(command: ClickByDescriptionCommand) -> dict:
+        logger.info("Request: click_by_description -> %s", command.description)
+        return await getBrowserManager().clickByDescription(
+            command.description, limit=command.limit, humanize=command.humanize
+        )
+
+    @app.post("/ai/plan")
+    async def planActions(command: PlanActionsCommand) -> dict:
+        logger.info("Request: plan_actions")
+        return await getBrowserManager().planActions(
+            command.goal, includeContext=command.includeContext
+        )
+
+    # ----------------------------------------------------------------- #
+    # Workflows (named saved sessions)
+    # ----------------------------------------------------------------- #
+    @app.post("/workflows/save")
+    async def saveWorkflow(command: WorkflowCommand) -> dict:
+        logger.info("Request: save_workflow -> %s", command.name)
+        return await getBrowserManager().saveWorkflow(command.name)
+
+    @app.get("/workflows")
+    async def listWorkflows() -> dict:
+        logger.info("Request: list_workflows")
+        return await getBrowserManager().listWorkflows()
+
+    @app.post("/workflows/run")
+    async def runWorkflow(command: RunWorkflowCommand) -> dict:
+        logger.info("Request: run_workflow -> %s", command.name)
+        return await getBrowserManager().runWorkflow(
+            command.name, delayMs=command.delayMs, continueOnError=command.continueOnError
+        )
+
+    # ----------------------------------------------------------------- #
+    # Browser sessions (pool of isolated browsers)
+    # ----------------------------------------------------------------- #
+    @app.get("/sessions")
+    async def getSessions() -> dict:
+        logger.info("Request: list_sessions")
+        return listSessions()
+
+    @app.post("/sessions/create")
+    async def makeSession(command: SessionCreateCommand) -> dict:
+        logger.info("Request: create_session")
+        return createSession(command.sessionId, makeActive=command.makeActive)
+
+    @app.post("/sessions/switch")
+    async def switchToSession(command: SessionSwitchCommand) -> dict:
+        logger.info("Request: switch_session -> %s", command.sessionId)
+        return switchSession(command.sessionId)
+
+    @app.post("/sessions/close")
+    async def closeSessionEndpoint(command: SessionSwitchCommand | None = None) -> dict:
+        logger.info("Request: close_session")
+        sessionId = command.sessionId if command else None
+        return await closeSession(sessionId)
 
     # ----------------------------------------------------------------- #
     # Global error handlers — no request ever returns a raw stack trace.
