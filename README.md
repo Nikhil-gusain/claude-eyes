@@ -39,7 +39,7 @@ ai-browser-controller/
 │   ├── agents/       # Claude & OpenAI adapters that map tools -> BrowserManager
 │   ├── mcp/          # MCP stdio server exposing every action as a tool
 │   ├── models/       # Pydantic command/response models (request + envelope shapes)
-│   ├── storage/      # Saved artifacts: screenshots/, recordings/ (gitkept, contents ignored)
+│   ├── storage/      # Artifacts: screenshots/ recordings/ sessions/ snapshots/ diffs/ workflows/ memory/ (contents ignored)
 │   └── utils/        # config (settings), logger, and shared helpers (response envelopes)
 ├── tests/            # pytest suite (browser tests auto-skip without Playwright browsers)
 ├── start.py          # CLI entrypoint: `api` | `mcp` | `info`
@@ -88,7 +88,7 @@ So a method named `takeScreenshot` (camelCase, internal) backs the MCP tool `tak
 
 ## Requirements / Prerequisites
 
-- **Python 3.12+**
+- **Python 3.11+**
 - **ffmpeg** — a **system** dependency (not a pip package). Required for recording / MP4 encoding. Install it and make sure it is on your `PATH`:
   - macOS: `brew install ffmpeg`
   - Debian/Ubuntu: `sudo apt install ffmpeg`
@@ -105,7 +105,7 @@ Everything is open-source and free, and is meant to be installed **only inside a
 
 ```bash
 # 1. Create and activate a virtualenv
-python3.12 -m venv venv
+python3.11 -m venv venv          # any Python >= 3.11
 source venv/bin/activate        # macOS/Linux
 venv\Scripts\activate           # Windows (PowerShell/cmd)
 
