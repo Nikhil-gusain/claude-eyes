@@ -70,6 +70,14 @@ class Settings:
         self.workflowDir: Path = Path(
             os.getenv("ABC_WORKFLOW_DIR", str(self.storageDir / "workflows"))
         )
+        # Website Skill System — persistent, per-domain operational knowledge the
+        # browser builds up over visits (routes/, workflows/, assets/ + JSON
+        # indexes). Distinct from page memory: memory stores *what a page was*,
+        # skills store *how a site works*. Everything lives under one root keyed
+        # by domain so no site can read another's skills.
+        self.discoveryStorage: Path = Path(
+            os.getenv("ABC_DISCOVERY_STORAGE", str(self.storageDir / "website_skills"))
+        )
         # Persistent browser profile (cookies, tokens, localStorage). Reusing one
         # directory across runs keeps the user logged into sites like Gmail. This
         # stays the *default* profile path; named multi-profiles live under
@@ -147,6 +155,19 @@ class Settings:
         self.geminiAiModel: str = os.getenv("ABC_GEMINI_AI_MODEL", "gemini-2.5-flash")
         self.openaiAiModel: str = os.getenv("ABC_OPENAI_AI_MODEL", "gpt-4o")
 
+        # ----- Website Skill System (discovery) ----------------------------
+        # Mode gates reads/writes of skills: OFF (disabled), READ_ONLY (read but
+        # never modify/create), LEARN (read + discover + update + create — the
+        # default). Confidence threshold is the floor below which a known route is
+        # auto-rediscovered; autoUpdate enables that automatic relearning on
+        # navigation; maxDepth bounds whole-site crawls.
+        self.discoveryMode: str = os.getenv("ABC_DISCOVERY_MODE", "LEARN").upper()
+        self.discoveryConfidenceThreshold: int = _envInt(
+            "ABC_DISCOVERY_CONFIDENCE_THRESHOLD", 50
+        )
+        self.discoveryAutoUpdate: bool = _envBool("ABC_DISCOVERY_AUTO_UPDATE", True)
+        self.discoveryMaxDepth: int = _envInt("ABC_DISCOVERY_MAX_DEPTH", 2)
+
         # ----- Logging ------------------------------------------------------
         self.logLevel: str = os.getenv("ABC_LOG_LEVEL", "INFO").upper()
 
@@ -173,6 +194,11 @@ class Settings:
             "diffDir": str(self.diffDir),
             "memoryDir": str(self.memoryDir),
             "workflowDir": str(self.workflowDir),
+            "discoveryStorage": str(self.discoveryStorage),
+            "discoveryMode": self.discoveryMode,
+            "discoveryConfidenceThreshold": self.discoveryConfidenceThreshold,
+            "discoveryAutoUpdate": self.discoveryAutoUpdate,
+            "discoveryMaxDepth": self.discoveryMaxDepth,
             "userDataDir": str(self.userDataDir),
             "profilesDir": str(self.profilesDir),
             "apiHost": self.apiHost,

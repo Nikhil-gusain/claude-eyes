@@ -674,6 +674,114 @@ TOOL_SPECS: list[dict[str, Any]] = [
         "parameters": {"type": "object", "properties": {}, "required": []},
     },
     # ------------------------------------------------------------------ #
+    # Website Skill System (persistent per-domain operational knowledge)
+    # ------------------------------------------------------------------ #
+    {
+        "name": "discover_page",
+        "description": "Learn how the CURRENT page works (or navigate to 'url' first): purpose, UI, forms, navigation, inferred workflows. Saves a persistent route skill (LEARN mode). Safe & read-only — never clicks destructive controls.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "Optional URL to navigate to before discovering."},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "discover_website",
+        "description": "Crawl internal routes from the current/start page (depth-bounded, safe) and learn a skill for each. Follows GET-like internal links only; never submits forms or clicks destructive UI.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "startUrl": {"type": "string", "description": "Optional URL to start from."},
+                "maxPages": {"type": "integer", "description": "Max pages to visit (default 10, hard cap 50)."},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "update_skill",
+        "description": "Record an outcome for a route's skill to tune its confidence. Pass success=true after a flow worked, success=false after it failed, or an explicit confidenceDelta. Low confidence triggers auto-rediscovery.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "URL of the route whose skill to update."},
+                "success": {"type": "boolean", "description": "true bumps confidence, false drops it."},
+                "confidenceDelta": {"type": "integer", "description": "Explicit confidence change (overrides success)."},
+            },
+            "required": ["url"],
+        },
+    },
+    {
+        "name": "list_skills",
+        "description": "List learned websites, or one domain's routes + workflows. Reads JSON indexes only (never scans folders).",
+        "parameters": {
+            "type": "object",
+            "properties": {"domain": {"type": "string", "description": "Optional domain (e.g. 'github.com') to drill into."}},
+            "required": [],
+        },
+    },
+    {
+        "name": "search_skills",
+        "description": "Keyword-search learned skills across domains/routes via the JSON indexes.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Words to match against domains/routes/titles."},
+                "limit": {"type": "integer", "description": "Max results (default 20)."},
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "export_skills",
+        "description": "Export learned skills (one domain or all) as a portable bundle, optionally writing to a file.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "domain": {"type": "string", "description": "Optional single domain to export."},
+                "savePath": {"type": "string", "description": "Optional file path to write the bundle to."},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "import_skills",
+        "description": "Import a skills bundle (inline 'bundle' dict or from 'path'). Skips existing files unless overwrite=true.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "bundle": {"type": "object", "description": "Inline bundle from export_skills."},
+                "path": {"type": "string", "description": "Path to a bundle JSON file."},
+                "overwrite": {"type": "boolean", "description": "Overwrite existing skill files (default false)."},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "clear_skills",
+        "description": "Forget one domain's skills (pass 'domain'), or wipe the entire skill store.",
+        "parameters": {
+            "type": "object",
+            "properties": {"domain": {"type": "string", "description": "Optional domain to clear; omit to wipe all."}},
+            "required": [],
+        },
+    },
+    {
+        "name": "set_discovery_mode",
+        "description": "Set the Website Skill System mode: OFF (disabled), READ_ONLY (read but never modify), or LEARN (read + discover + update — default).",
+        "parameters": {
+            "type": "object",
+            "properties": {"mode": {"type": "string", "enum": ["OFF", "READ_ONLY", "LEARN"], "description": "New mode."}},
+            "required": ["mode"],
+        },
+    },
+    {
+        "name": "get_discovery_status",
+        "description": "Report discovery mode, storage path, learned-website count, and thresholds.",
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+    # ------------------------------------------------------------------ #
     # OCR
     # ------------------------------------------------------------------ #
     {
@@ -1002,6 +1110,34 @@ async def dispatchTool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         return await manager.listMemory(limit=arguments.get("limit", 50))
     if name == "clear_memory":
         return await manager.clearMemory()
+    if name == "discover_page":
+        return await manager.discoverPage(arguments.get("url"))
+    if name == "discover_website":
+        return await manager.discoverWebsite(
+            startUrl=arguments.get("startUrl"), maxPages=arguments.get("maxPages", 10)
+        )
+    if name == "update_skill":
+        return await manager.updateSkill(
+            arguments["url"], success=arguments.get("success"),
+            confidenceDelta=arguments.get("confidenceDelta"),
+        )
+    if name == "list_skills":
+        return await manager.listSkills(arguments.get("domain"))
+    if name == "search_skills":
+        return await manager.searchSkills(arguments["query"], limit=arguments.get("limit", 20))
+    if name == "export_skills":
+        return await manager.exportSkills(arguments.get("domain"), savePath=arguments.get("savePath"))
+    if name == "import_skills":
+        return await manager.importSkills(
+            bundle=arguments.get("bundle"), path=arguments.get("path"),
+            overwrite=arguments.get("overwrite", False),
+        )
+    if name == "clear_skills":
+        return await manager.clearSkills(arguments.get("domain"))
+    if name == "set_discovery_mode":
+        return await manager.setDiscoveryMode(arguments["mode"])
+    if name == "get_discovery_status":
+        return await manager.getDiscoveryStatus()
     if name == "extract_text_from_screenshot":
         return await manager.extractTextFromScreenshot(
             fullPage=arguments.get("fullPage", False),

@@ -23,6 +23,7 @@ A plug-and-play browser automation layer that lets an AI agent control a real, a
 - **Named workflows** — `save_workflow` / `run_workflow` / `list_workflows` save a recorded session under a name and replay it later by name — no AI needed, fast and deterministic.
 - **AI judgment (provider follows the driver)** — turns automation into *self-correcting* automation: `verify_goal` looks at a screenshot and judges whether a plain-language goal is met (`{success, confidence, reason}`); `find_element` / `click_by_description` locate an element from a description like "blue login button"; `plan_actions` returns an inspectable step plan. These reason with **whoever is driving** — a Gemini-driven run judges with Gemini, a Claude/Claude-Code run judges with Claude, OpenAI with OpenAI (set explicitly via `ABC_AI_PROVIDER`). Degrades to a clear "unavailable" error when that provider's SDK/key is absent.
 - **Browser memory** — `remember_page` stores a page's title/URL/structure/screenshot; `search_memory` recalls it later by keyword so the agent avoids re-scraping pages it has already seen.
+- **Website Skill System (persistent operational knowledge)** — the browser permanently *learns how each site works* and reuses it on future visits. On navigation it reads `website_skills/websites.json` → the domain's `index.json` → only the matching route markdown (O(1) lookup, never a folder scan); if the route is new or low-confidence it auto-runs a safe, staged discovery (static → navigation → interaction-detect → workflow inference) and saves a route skill. Knowledge is **merged and versioned, never overwritten**; per-route confidence rises on success and falls on failure, triggering automatic rediscovery below a threshold. Discovery is non-destructive (never clicks delete/pay/logout). Modes: `OFF` / `READ_ONLY` / `LEARN` (default, enabled by default but fully optional). Tools: `discover_page`, `discover_website`, `update_skill`, `list_skills`, `search_skills`, `export_skills`, `import_skills`, `clear_skills`, `set_discovery_mode`, `get_discovery_status`. Distinct from browser memory: memory stores *what a page was*, skills store *how a site works*.
 - **OCR** — `extract_text_from_screenshot` / `read_image` read text baked into images/canvas via Tesseract (optional dependency; honest error with install hints when absent).
 - **Browser session pool** — `create_session` / `list_sessions` / `switch_session` / `close_session` run several isolated browsers (own cookies/tabs/state) with one active at a time; every other tool drives the active session.
 - **Screen recording to MP4** — record a browser session and finalize it to a video file (ffmpeg-backed).
@@ -65,6 +66,8 @@ Module map:
 | `app/browser/session_recorder.py` | `SessionRecorder` — structured, replayable action log (save/load/replay). |
 | `app/browser/visual_diff.py` | Pixel diff of two screenshots (% changed + changed regions). |
 | `app/browser/page_memory.py` | `PageMemory` — searchable store of pages the agent has seen (`getPageMemory()`). |
+| `app/browser/website_skills.py` | `WebsiteSkillManager` — persistent per-domain operational knowledge (JSON indexes + versioned route markdown, modes, confidence) (`getWebsiteSkillManager()`). |
+| `app/browser/discovery_engine.py` | `DiscoveryEngine` — safe, staged, non-destructive page discovery → structured route skill (heuristic, browser-free testable). |
 | `app/browser/ocr.py` | Optional Tesseract OCR for text inside images/screenshots (graceful when absent). |
 | `app/browser/intelligence.py` | Claude-backed goal verification / element finding / planning (graceful when absent). |
 | `app/browser/session_pool.py` | `SessionPool` — many isolated browsers, one active; backs `getBrowserManager()`. |
@@ -278,6 +281,9 @@ Exposed MCP tools (snake_case, the external contract):
   `click_by_description`, `plan_actions`.
 - **OCR:** `extract_text_from_screenshot`, `read_image`.
 - **Memory:** `remember_page`, `search_memory`, `list_memory`, `clear_memory`.
+- **Website skills:** `discover_page`, `discover_website`, `update_skill`,
+  `list_skills`, `search_skills`, `export_skills`, `import_skills`,
+  `clear_skills`, `set_discovery_mode`, `get_discovery_status`.
 - **State / sessions:** `create_snapshot`, `restore_snapshot`, `start_session`,
   `stop_session`, `save_session`, `load_session`, `replay_session`,
   `save_workflow`, `run_workflow`, `list_workflows`,
@@ -358,6 +364,11 @@ All runtime settings are resolved once at import time from `ABC_*` environment v
 | `ABC_DIFF_DIR` | `diffDir` | `app/storage/diffs` | Where visual-diff masks are saved. |
 | `ABC_MEMORY_DIR` / `ABC_MEMORY_FILE` | `memoryDir` / `memoryFile` | `app/storage/memory` | Browser-memory store location. |
 | `ABC_WORKFLOW_DIR` | `workflowDir` | `app/storage/workflows` | Where named workflows are saved. |
+| `ABC_DISCOVERY_MODE` | `discoveryMode` | `LEARN` | Website Skill System mode: `OFF` \| `READ_ONLY` \| `LEARN`. |
+| `ABC_DISCOVERY_STORAGE` | `discoveryStorage` | `app/storage/website_skills` | Root holding per-domain learned skills + `websites.json`. |
+| `ABC_DISCOVERY_CONFIDENCE_THRESHOLD` | `discoveryConfidenceThreshold` | `50` | Confidence floor below which a known route auto-rediscovers. |
+| `ABC_DISCOVERY_AUTO_UPDATE` | `discoveryAutoUpdate` | `true` | Auto-discover/relearn on navigation (LEARN mode only). |
+| `ABC_DISCOVERY_MAX_DEPTH` | `discoveryMaxDepth` | `2` | Max crawl depth for whole-site discovery. |
 | `ABC_AI_MODEL` | `aiModel` | `claude-opus-4-8` | Claude model for verify_goal / find_element / plan_actions. |
 | `ABC_PROFILES_DIR` | `profilesDir` | `app/storage/profiles` | Root for named browser profiles. |
 | `ABC_ACTIVE_PROFILE_FILE` | `activeProfileFile` | `app/storage/active_profile.json` | Persisted active-profile pointer. |

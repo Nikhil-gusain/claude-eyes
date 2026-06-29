@@ -27,7 +27,9 @@ from app.browser import intelligence
 from app.browser import media
 from app.browser import ocr
 from app.browser import visual_diff
+from app.browser.discovery_engine import getDiscoveryEngine
 from app.browser.page_memory import getPageMemory
+from app.browser.website_skills import getWebsiteSkillManager
 from app.browser.playwright_controller import PlaywrightController
 from app.browser.profiles import getProfileManager
 from app.browser.screenshot_manager import ScreenshotManager
@@ -57,6 +59,11 @@ class BrowserManager:
         # Structured action log (replayable JSON), distinct from the video recorder.
         self.session = SessionRecorder()
         self.profiles = getProfileManager()
+        # Website Skill System: persistent per-domain operational knowledge. The
+        # manager is the facade; this delegate owns all skill logic (req: don't
+        # mix discovery into BrowserManager). Discovery runs the staged crawler.
+        self.skills = getWebsiteSkillManager()
+        self.discovery = getDiscoveryEngine()
         # Global "no-image mode": when on, pixel screenshots are suppressed in
         # favour of MarkItDown text. Starts from the configured default.
         self.noImageMode: bool = settings.noImageMode
@@ -269,11 +276,42 @@ class BrowserManager:
                     profileName=name,
                     channel=settings.browserChannel,
                 )
-            return await self.controller.openUrl(url, waitUntil=waitUntil, timeoutMs=timeoutMs)
+            result = await self.controller.openUrl(url, waitUntil=waitUntil, timeoutMs=timeoutMs)
+            # Website Skill System: load known knowledge for this page (and, in
+            # LEARN mode, auto-discover when the route is new or low-confidence)
+            # so the driving AI has operational context before it reasons.
+            result["skill"] = await self._onNavigated(result.get("url") or url)
+            return result
 
         return await self._run(
             "navigate", op, recordParams={"url": url, "waitUntil": waitUntil, "timeoutMs": timeoutMs}
         )
+
+    async def _onNavigated(self, url: str) -> dict[str, Any]:
+        """Skill hook fired after a successful navigation (req: auto, no user action).
+
+        Runs inside ``navigate``'s lock, so it must touch the controller DIRECTLY
+        (never re-enter manager methods, which would deadlock the non-reentrant
+        lock). Loads the route skill; in LEARN mode it discovers an unknown or
+        stale route and saves it. Failures never break navigation.
+        """
+        try:
+            self.skills.recordVisit(url)
+            loaded = self.skills.loadForUrl(url)
+            shouldLearn = (
+                self.skills.mode == "LEARN"
+                and settings.discoveryAutoUpdate
+                and (not loaded.get("routeKnown") or loaded.get("needsRediscovery"))
+            )
+            if shouldLearn:
+                discovery = await self.discovery.discoverPage(self.controller)
+                saved = self.skills.saveDiscovery(url, discovery)
+                loaded = self.skills.loadForUrl(url)
+                loaded["discovered"] = saved
+            return loaded
+        except Exception as exc:  # noqa: BLE001 - skills are best-effort context
+            logger.warning("Skill hook failed for %s: %s", url, exc)
+            return {"known": False, "error": str(exc)}
 
     async def navigateBack(self) -> dict[str, Any]:
         return await self._run("navigate_back", self._guard(self.controller.navigateBack), recordParams={})
@@ -980,6 +1018,140 @@ class BrowserManager:
         )
 
     # ------------------------------------------------------------------ #
+    # Website Skill System (persistent per-domain operational knowledge)
+    # ------------------------------------------------------------------ #
+    async def discoverPage(self, url: str | None = None) -> dict[str, Any]:
+        """Discover the CURRENT page (or navigate to *url* first) and save its skill."""
+        async def op() -> dict[str, Any]:
+            self._requireRunning()
+            if url:
+                await self.controller.openUrl(url, waitUntil="networkidle")
+            current = (await self.controller.getUrl()).get("url")
+            discovery = await self.discovery.discoverPage(self.controller)
+            saved = (
+                self.skills.saveDiscovery(current, discovery)
+                if self.skills.mode == "LEARN"
+                else {"saved": False, "mode": self.skills.mode}
+            )
+            return {"discovery": discovery, "saved": saved}
+
+        return await self._run("discover_page", op)
+
+    async def discoverWebsite(
+        self, startUrl: str | None = None, maxPages: int = 10
+    ) -> dict[str, Any]:
+        """Crawl internal routes from the current/Start page (depth-bounded) and learn each.
+
+        Runs entirely under one lock and navigates via the controller directly, so
+        it never re-enters :meth:`navigate`. Safe by construction: it only follows
+        GET-like internal links and never submits forms or clicks destructive UI.
+        """
+        async def op() -> dict[str, Any]:
+            self._requireRunning()
+            if startUrl:
+                await self.controller.openUrl(startUrl, waitUntil="networkidle")
+            from app.browser.website_skills import domainOf  # noqa: PLC0415
+            from app.browser.discovery_engine import classifyNavigation, routeOf  # noqa: PLC0415
+
+            start = (await self.controller.getUrl()).get("url")
+            domain = domainOf(start)
+            cap = max(1, min(maxPages, 50))  # ponytail: hard cap; raise if needed
+            seen: set[str] = set()
+            queue: list[str] = [start]
+            learned: list[dict[str, Any]] = []
+            while queue and len(seen) < cap:
+                current = queue.pop(0)
+                route = routeOf(current)
+                if route in seen:
+                    continue
+                seen.add(route)
+                if domainOf(current) != domain:
+                    continue
+                try:
+                    await self.controller.openUrl(current, waitUntil="networkidle")
+                    discovery = await self.discovery.discoverPage(self.controller)
+                    if self.skills.mode == "LEARN":
+                        learned.append(self.skills.saveDiscovery(
+                            (await self.controller.getUrl()).get("url"), discovery))
+                    links = (await self.controller.extractLinks()).get("links", [])
+                    for r in classifyNavigation(links, current)["internalRoutes"]:
+                        nextUrl = f"https://{domain}{r['route']}"
+                        if r["route"] not in seen and len(seen) + len(queue) < cap:
+                            queue.append(nextUrl)
+                except Exception as exc:  # noqa: BLE001 - skip a bad page, keep crawling
+                    logger.warning("discover_website: skipped %s (%s)", current, exc)
+            return {"domain": domain, "pagesVisited": len(seen), "learned": learned,
+                    "mode": self.skills.mode}
+
+        return await self._run("discover_website", op)
+
+    async def updateSkill(
+        self,
+        url: str,
+        success: bool | None = None,
+        confidenceDelta: int | None = None,
+    ) -> dict[str, Any]:
+        """Record an outcome against a route's skill (drives confidence / rediscovery)."""
+        async def op() -> dict[str, Any]:
+            if confidenceDelta is not None:
+                return self.skills.adjustConfidence(url, confidenceDelta)
+            if success is True:
+                return self.skills.recordSuccess(url)
+            if success is False:
+                return self.skills.recordFailure(url)
+            raise ValueError("Provide 'success' (bool) or 'confidenceDelta' (int).")
+
+        return await self._run("update_skill", op)
+
+    async def listSkills(self, domain: str | None = None) -> dict[str, Any]:
+        """List known websites, or one domain's routes + workflows."""
+        return await self._run("list_skills", lambda: self._async(self.skills.listSkills(domain)))
+
+    async def searchSkills(self, query: str, limit: int = 20) -> dict[str, Any]:
+        """Keyword-search learned skills using the JSON indexes (no folder scans)."""
+        return await self._run(
+            "search_skills", lambda: self._async(self.skills.searchSkills(query, limit))
+        )
+
+    async def exportSkills(self, domain: str | None = None, savePath: str | None = None) -> dict[str, Any]:
+        """Export skills (one domain or all) as a portable bundle; optionally to a file."""
+        async def op() -> dict[str, Any]:
+            bundle = self.skills.exportSkills(domain)
+            if savePath:
+                Path(savePath).parent.mkdir(parents=True, exist_ok=True)
+                Path(savePath).write_text(json.dumps(bundle, indent=2), encoding="utf-8")
+                return {"path": savePath, "domains": list(bundle["domains"].keys())}
+            return bundle
+
+        return await self._run("export_skills", op)
+
+    async def importSkills(
+        self, bundle: dict[str, Any] | None = None, path: str | None = None, overwrite: bool = False
+    ) -> dict[str, Any]:
+        """Import a skills bundle (inline dict or from a file)."""
+        async def op() -> dict[str, Any]:
+            data = bundle
+            if data is None:
+                if not path:
+                    raise ValueError("Provide either inline 'bundle' or a 'path' to import.")
+                data = json.loads(Path(path).read_text(encoding="utf-8"))
+            return self.skills.importSkills(data, overwrite=overwrite)
+
+        return await self._run("import_skills", op)
+
+    async def clearSkills(self, domain: str | None = None) -> dict[str, Any]:
+        """Forget one domain's skills, or wipe the whole skill store."""
+        return await self._run("clear_skills", lambda: self._async(self.skills.clearSkills(domain)))
+
+    async def setDiscoveryMode(self, mode: str) -> dict[str, Any]:
+        """Set the Website Skill System mode: OFF, READ_ONLY, or LEARN."""
+        return await self._run("set_discovery_mode", lambda: self._async(self.skills.setMode(mode)))
+
+    async def getDiscoveryStatus(self) -> dict[str, Any]:
+        """Report discovery mode, storage, website count, and thresholds."""
+        return await self._run("get_discovery_status", lambda: self._async(self.skills.status()))
+
+    # ------------------------------------------------------------------ #
     # Status
     # ------------------------------------------------------------------ #
     async def status(self) -> dict[str, Any]:
@@ -991,6 +1163,7 @@ class BrowserManager:
             snapshot["sessionSteps"] = len(self.session.steps)
             snapshot["activeProfile"] = self.profiles.getActiveProfile()
             snapshot["noImageMode"] = self.noImageMode
+            snapshot["discoveryMode"] = self.skills.mode
             return snapshot
 
         return await self._run("status", op)

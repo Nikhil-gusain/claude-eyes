@@ -40,11 +40,16 @@ from app.models.commands import (
     AuditCommand,
     ClickByDescriptionCommand,
     ClickCommand,
+    DiscoverPageCommand,
+    DiscoverWebsiteCommand,
+    DiscoveryModeCommand,
     DownloadCommand,
+    ExportSkillsCommand,
     ExtractCommand,
     FillCommand,
     FindElementCommand,
     HoverCommand,
+    ImportSkillsCommand,
     LaunchCommand,
     LoginSessionCommand,
     MarkdownCommand,
@@ -68,9 +73,11 @@ from app.models.commands import (
     SessionSaveCommand,
     SessionStartCommand,
     SessionSwitchCommand,
+    SkillSearchCommand,
     SnapshotCreateCommand,
     SnapshotRestoreCommand,
     TabCommand,
+    UpdateSkillCommand,
     UploadCommand,
     VerifyGoalCommand,
     VisualDiffCommand,
@@ -606,6 +613,65 @@ def createApp() -> FastAPI:
     async def clearMemory() -> dict:
         logger.info("Request: clear_memory")
         return await getBrowserManager().clearMemory()
+
+    # ----------------------------------------------------------------- #
+    # Website Skill System (persistent per-domain operational knowledge)
+    # ----------------------------------------------------------------- #
+    @app.post("/skills/discover/page")
+    async def discoverPage(command: DiscoverPageCommand) -> dict:
+        logger.info("Request: discover_page -> %s", command.url)
+        return await getBrowserManager().discoverPage(command.url)
+
+    @app.post("/skills/discover/website")
+    async def discoverWebsite(command: DiscoverWebsiteCommand) -> dict:
+        logger.info("Request: discover_website -> %s", command.startUrl)
+        return await getBrowserManager().discoverWebsite(
+            startUrl=command.startUrl, maxPages=command.maxPages
+        )
+
+    @app.post("/skills/update")
+    async def updateSkill(command: UpdateSkillCommand) -> dict:
+        logger.info("Request: update_skill -> %s", command.url)
+        return await getBrowserManager().updateSkill(
+            command.url, success=command.success, confidenceDelta=command.confidenceDelta
+        )
+
+    @app.get("/skills")
+    async def listSkills(domain: str | None = None) -> dict:
+        logger.info("Request: list_skills")
+        return await getBrowserManager().listSkills(domain)
+
+    @app.post("/skills/search")
+    async def searchSkills(command: SkillSearchCommand) -> dict:
+        logger.info("Request: search_skills -> %s", command.query)
+        return await getBrowserManager().searchSkills(command.query, limit=command.limit)
+
+    @app.post("/skills/export")
+    async def exportSkills(command: ExportSkillsCommand) -> dict:
+        logger.info("Request: export_skills")
+        return await getBrowserManager().exportSkills(command.domain, savePath=command.savePath)
+
+    @app.post("/skills/import")
+    async def importSkills(command: ImportSkillsCommand) -> dict:
+        logger.info("Request: import_skills")
+        return await getBrowserManager().importSkills(
+            bundle=command.bundle, path=command.path, overwrite=command.overwrite
+        )
+
+    @app.post("/skills/clear")
+    async def clearSkills(domain: str | None = None) -> dict:
+        logger.info("Request: clear_skills")
+        return await getBrowserManager().clearSkills(domain)
+
+    @app.post("/skills/mode")
+    async def setDiscoveryMode(command: DiscoveryModeCommand) -> dict:
+        logger.info("Request: set_discovery_mode -> %s", command.mode)
+        return await getBrowserManager().setDiscoveryMode(command.mode)
+
+    @app.get("/skills/status")
+    async def getDiscoveryStatus() -> dict:
+        logger.info("Request: get_discovery_status")
+        return await getBrowserManager().getDiscoveryStatus()
 
     # ----------------------------------------------------------------- #
     # OCR

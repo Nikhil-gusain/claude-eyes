@@ -1052,6 +1052,131 @@ async def clearMemory() -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------- #
+# Website Skill System (persistent per-domain operational knowledge)
+# --------------------------------------------------------------------- #
+@mcp.tool(name="discover_page")
+@safeAsync(action="discover_page")
+async def discoverPage(url: str | None = None) -> dict[str, Any]:
+    """Learn how the CURRENT page works and save a persistent route skill.
+
+    Distils the page into purpose, UI, forms, navigation, and inferred workflows,
+    then merges it into the site's knowledge base (never overwriting prior
+    discoveries). Safe and non-destructive — it never clicks dangerous controls.
+
+    Args:
+        url: Optional URL to navigate to before discovering.
+    """
+    return await getBrowserManager().discoverPage(url)
+
+
+@mcp.tool(name="discover_website")
+@safeAsync(action="discover_website")
+async def discoverWebsite(startUrl: str | None = None, maxPages: int = 10) -> dict[str, Any]:
+    """Crawl internal routes (depth-bounded, safe) and learn a skill for each.
+
+    Args:
+        startUrl: Optional URL to start from (defaults to the current page).
+        maxPages: Max pages to visit (default 10, hard cap 50).
+    """
+    return await getBrowserManager().discoverWebsite(startUrl=startUrl, maxPages=maxPages)
+
+
+@mcp.tool(name="update_skill")
+@safeAsync(action="update_skill")
+async def updateSkill(
+    url: str, success: bool | None = None, confidenceDelta: int | None = None
+) -> dict[str, Any]:
+    """Record an outcome for a route's skill to tune its confidence.
+
+    Args:
+        url: URL of the route whose skill to update.
+        success: ``True`` bumps confidence, ``False`` drops it (triggers rediscovery when low).
+        confidenceDelta: Explicit confidence change (overrides ``success``).
+    """
+    return await getBrowserManager().updateSkill(url, success=success, confidenceDelta=confidenceDelta)
+
+
+@mcp.tool(name="list_skills")
+@safeAsync(action="list_skills")
+async def listSkills(domain: str | None = None) -> dict[str, Any]:
+    """List learned websites, or one domain's routes + workflows (JSON indexes only).
+
+    Args:
+        domain: Optional domain (e.g. ``github.com``) to drill into.
+    """
+    return await getBrowserManager().listSkills(domain)
+
+
+@mcp.tool(name="search_skills")
+@safeAsync(action="search_skills")
+async def searchSkills(query: str, limit: int = 20) -> dict[str, Any]:
+    """Keyword-search learned skills across domains/routes via the JSON indexes.
+
+    Args:
+        query: Words to match against domains/routes/titles.
+        limit: Max results (default 20).
+    """
+    return await getBrowserManager().searchSkills(query, limit=limit)
+
+
+@mcp.tool(name="export_skills")
+@safeAsync(action="export_skills")
+async def exportSkills(domain: str | None = None, savePath: str | None = None) -> dict[str, Any]:
+    """Export learned skills (one domain or all) as a portable bundle.
+
+    Args:
+        domain: Optional single domain to export.
+        savePath: Optional file path to write the bundle to.
+    """
+    return await getBrowserManager().exportSkills(domain, savePath=savePath)
+
+
+@mcp.tool(name="import_skills")
+@safeAsync(action="import_skills")
+async def importSkills(
+    bundle: dict[str, Any] | None = None, path: str | None = None, overwrite: bool = False
+) -> dict[str, Any]:
+    """Import a skills bundle (inline ``bundle`` or from ``path``).
+
+    Args:
+        bundle: Inline bundle produced by ``export_skills``.
+        path: Path to a bundle JSON file.
+        overwrite: Overwrite existing skill files (default ``False``).
+    """
+    return await getBrowserManager().importSkills(bundle=bundle, path=path, overwrite=overwrite)
+
+
+@mcp.tool(name="clear_skills")
+@safeAsync(action="clear_skills")
+async def clearSkills(domain: str | None = None) -> dict[str, Any]:
+    """Forget one domain's skills, or wipe the entire skill store.
+
+    Args:
+        domain: Optional domain to clear; omit to wipe everything.
+    """
+    return await getBrowserManager().clearSkills(domain)
+
+
+@mcp.tool(name="set_discovery_mode")
+@safeAsync(action="set_discovery_mode")
+async def setDiscoveryMode(mode: str) -> dict[str, Any]:
+    """Set the Website Skill System mode: ``OFF``, ``READ_ONLY``, or ``LEARN``.
+
+    Args:
+        mode: ``OFF`` (disabled), ``READ_ONLY`` (read but never modify), or
+            ``LEARN`` (read + discover + update — the default).
+    """
+    return await getBrowserManager().setDiscoveryMode(mode)
+
+
+@mcp.tool(name="get_discovery_status")
+@safeAsync(action="get_discovery_status")
+async def getDiscoveryStatus() -> dict[str, Any]:
+    """Report discovery mode, storage path, learned-website count, and thresholds."""
+    return await getBrowserManager().getDiscoveryStatus()
+
+
+# --------------------------------------------------------------------- #
 # OCR (read text baked into images / screenshots)
 # --------------------------------------------------------------------- #
 @mcp.tool(name="extract_text_from_screenshot")

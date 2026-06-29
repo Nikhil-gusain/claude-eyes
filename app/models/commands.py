@@ -240,6 +240,43 @@ class MemorySearchCommand(BaseModel):
     limit: int = Field(default=10, ge=1, le=200)
 
 
+class DiscoverPageCommand(BaseModel):
+    """Discover (learn) the current page, or navigate to ``url`` first."""
+
+    url: Optional[str] = None
+
+
+class DiscoverWebsiteCommand(BaseModel):
+    startUrl: Optional[str] = None
+    maxPages: int = Field(default=10, ge=1, le=50)
+
+
+class UpdateSkillCommand(BaseModel):
+    url: str
+    success: Optional[bool] = None
+    confidenceDelta: Optional[int] = Field(default=None, ge=-100, le=100)
+
+
+class SkillSearchCommand(BaseModel):
+    query: str
+    limit: int = Field(default=20, ge=1, le=200)
+
+
+class ExportSkillsCommand(BaseModel):
+    domain: Optional[str] = None
+    savePath: Optional[str] = None
+
+
+class ImportSkillsCommand(BaseModel):
+    bundle: Optional[dict] = None
+    path: Optional[str] = None
+    overwrite: bool = False
+
+
+class DiscoveryModeCommand(BaseModel):
+    mode: str = Field(..., description="OFF, READ_ONLY, or LEARN.")
+
+
 class OcrScreenshotCommand(BaseModel):
     """OCR the current page (or an element) screenshot."""
 

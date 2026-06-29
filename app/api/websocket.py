@@ -290,6 +290,29 @@ def _buildDispatchTable() -> dict[str, DispatchFn]:
         ),
         "list_memory": lambda manager, params: manager.listMemory(limit=params.get("limit", 50)),
         "clear_memory": lambda manager, params: manager.clearMemory(),
+        # Website Skill System
+        "discover_page": lambda manager, params: manager.discoverPage(params.get("url")),
+        "discover_website": lambda manager, params: manager.discoverWebsite(
+            startUrl=params.get("startUrl"), maxPages=params.get("maxPages", 10)
+        ),
+        "update_skill": lambda manager, params: manager.updateSkill(
+            params["url"], success=params.get("success"),
+            confidenceDelta=params.get("confidenceDelta"),
+        ),
+        "list_skills": lambda manager, params: manager.listSkills(params.get("domain")),
+        "search_skills": lambda manager, params: manager.searchSkills(
+            params["query"], limit=params.get("limit", 20)
+        ),
+        "export_skills": lambda manager, params: manager.exportSkills(
+            params.get("domain"), savePath=params.get("savePath")
+        ),
+        "import_skills": lambda manager, params: manager.importSkills(
+            bundle=params.get("bundle"), path=params.get("path"),
+            overwrite=params.get("overwrite", False),
+        ),
+        "clear_skills": lambda manager, params: manager.clearSkills(params.get("domain")),
+        "set_discovery_mode": lambda manager, params: manager.setDiscoveryMode(params["mode"]),
+        "get_discovery_status": lambda manager, params: manager.getDiscoveryStatus(),
         # OCR
         "extract_text_from_screenshot": lambda manager, params: manager.extractTextFromScreenshot(
             fullPage=params.get("fullPage", False),

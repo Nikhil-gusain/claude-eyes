@@ -37,11 +37,13 @@ app/storage/snapshots/*
 app/storage/diffs/*
 app/storage/memory/*
 app/storage/workflows/*
+app/storage/website_skills/*
 !app/storage/screenshots/.gitkeep
 !app/storage/recordings/.gitkeep
 !app/storage/sessions/.gitkeep
 !app/storage/diffs/.gitkeep
 !app/storage/workflows/.gitkeep
+!app/storage/website_skills/.gitkeep
 
 # --- Persistent browser profile(s): cookies/tokens/logins — NEVER commit ----
 app/storage/browser_profile/
