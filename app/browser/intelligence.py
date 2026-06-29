@@ -1,4 +1,4 @@
-"""AI-judgment helpers — the "smart" tools that call Claude.
+"""AI-judgment helpers — the "smart" tools, backed by a pluggable LLM provider.
 
 These turn raw browser automation into *self-correcting* automation:
 
@@ -8,10 +8,13 @@ These turn raw browser automation into *self-correcting* automation:
   "blue login button" from a list of on-page candidates.
 * :func:`planActions` — break a high-level goal into an ordered action plan.
 
-Anthropic is an OPTIONAL dependency here, exactly like MarkItDown/Tesseract
-elsewhere: when the ``anthropic`` SDK or ``ANTHROPIC_API_KEY`` is missing every
-call returns a structured error envelope (never raises), so the import is always
-safe and the feature degrades cleanly. Model id comes from ``settings.aiModel``.
+The provider is whoever is DRIVING the browser: the in-process agent adapters
+(Gemini / Claude / OpenAI) call :func:`setAiProvider` so judgment uses the same
+brain; the MCP path (Claude Code) keeps ``settings.aiProvider`` (default
+``claude``). Every provider SDK is an OPTIONAL dependency — when the active
+provider's SDK or API key is missing, each call returns a structured error
+envelope (never raises), so the import is always safe and the feature degrades
+cleanly.
 """
 
 from __future__ import annotations
@@ -28,29 +31,74 @@ from app.utils.logger import getLogger
 logger = getLogger("browser.intelligence")
 
 
-def aiAvailable() -> bool:
-    """Whether the Claude-backed tools can run (SDK installed + API key set)."""
+# --------------------------------------------------------------------------- #
+# Active provider — the brain doing the judgment. Defaults to the configured
+# provider; the in-process adapters override it to match whoever is driving.
+# --------------------------------------------------------------------------- #
+_activeProvider: str = settings.aiProvider
+
+
+def setAiProvider(name: str) -> None:
+    """Set which provider backs the smart tools (``claude``/``gemini``/``openai``).
+
+    Called by the agent adapters so that, e.g., a Gemini-driven run also judges
+    goals and finds elements with Gemini.
+    """
+    global _activeProvider
+    _activeProvider = (name or "").lower() or settings.aiProvider
+
+
+def getAiProvider() -> str:
+    """Return the currently active judgment provider."""
+    return _activeProvider
+
+
+# Per-provider readiness: (importable SDK?, env key present?, how to fix).
+def _providerStatus(provider: str) -> tuple[bool, str]:
+    """Return ``(ready, details)`` for *provider* without importing on success path."""
+    if provider == "gemini":
+        try:
+            from google import genai  # noqa: F401, PLC0415 - optional dependency
+        except Exception:  # noqa: BLE001
+            return False, "Install the 'google-genai' package (pip install google-genai)."
+        from app.agents.gemini_keys import loadKeys  # noqa: PLC0415 - avoid cycle
+
+        if not loadKeys():
+            return False, "Set GEMINI_API_KEY / GEMINI_API_KEYS (or GOOGLE_API_KEY)."
+        return True, ""
+    if provider == "openai":
+        try:
+            import openai  # noqa: F401, PLC0415 - optional dependency
+        except Exception:  # noqa: BLE001
+            return False, "Install the 'openai' package (pip install openai)."
+        if not os.getenv("OPENAI_API_KEY"):
+            return False, "Set OPENAI_API_KEY in the environment."
+        return True, ""
+    # Default: claude.
     try:
         import anthropic  # noqa: F401, PLC0415 - optional dependency
     except Exception:  # noqa: BLE001
-        return False
-    return bool(os.getenv("ANTHROPIC_API_KEY"))
+        return False, "Install the 'anthropic' package (pip install anthropic)."
+    if not os.getenv("ANTHROPIC_API_KEY"):
+        return False, "Set ANTHROPIC_API_KEY in the environment."
+    return True, ""
+
+
+def aiAvailable() -> bool:
+    """Whether the ACTIVE provider's smart tools can run (SDK installed + key set)."""
+    return _providerStatus(_activeProvider)[0]
 
 
 def _unavailable() -> dict[str, Any]:
-    try:
-        import anthropic  # noqa: F401, PLC0415
-
-        havePkg = True
-    except Exception:  # noqa: BLE001
-        havePkg = False
-    if not havePkg:
-        details = "Install the 'anthropic' package (pip install anthropic)."
-    elif not os.getenv("ANTHROPIC_API_KEY"):
-        details = "Set ANTHROPIC_API_KEY in the environment."
-    else:  # pragma: no cover - defensive
-        details = "Claude is not configured."
-    return {"error": "AI features are unavailable", "details": details, "aiAvailable": False}
+    ready, details = _providerStatus(_activeProvider)
+    if ready:  # pragma: no cover - defensive
+        details = f"The '{_activeProvider}' provider is not configured."
+    return {
+        "error": "AI features are unavailable",
+        "details": details,
+        "provider": _activeProvider,
+        "aiAvailable": False,
+    }
 
 
 def _extractJson(text: str) -> Any:
@@ -66,10 +114,47 @@ def _extractJson(text: str) -> Any:
     raise ValueError(f"No JSON found in model reply: {text[:200]}")
 
 
-def _complete(content: list[dict[str, Any]], system: str, maxTokens: int = 1024) -> str:
-    """Run one non-streaming Claude message and return its concatenated text."""
+def _complete(
+    system: str,
+    userText: str,
+    *,
+    imageBytes: bytes | None = None,
+    mediaType: str = "image/png",
+    maxTokens: int = 1024,
+) -> str:
+    """Run one non-streaming completion on the ACTIVE provider; return its text.
+
+    Provider-neutral surface: a system prompt, the user text, and an optional
+    screenshot. Each provider builds its own request shape internally so the
+    three smart tools above stay backend-agnostic.
+    """
+    provider = _activeProvider
+    if provider == "gemini":
+        return _completeGemini(system, userText, imageBytes, mediaType, maxTokens)
+    if provider == "openai":
+        return _completeOpenAI(system, userText, imageBytes, mediaType, maxTokens)
+    return _completeClaude(system, userText, imageBytes, mediaType, maxTokens)
+
+
+def _completeClaude(
+    system: str, userText: str, imageBytes: bytes | None, mediaType: str, maxTokens: int
+) -> str:
+    """One Claude (Anthropic) message; vision when *imageBytes* is given."""
     import anthropic  # noqa: PLC0415 - optional dependency
 
+    content: list[dict[str, Any]] = []
+    if imageBytes is not None:
+        content.append(
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": mediaType,
+                    "data": base64.b64encode(imageBytes).decode("ascii"),
+                },
+            }
+        )
+    content.append({"type": "text", "text": userText})
     client = anthropic.Anthropic()
     response = client.messages.create(
         model=settings.aiModel,
@@ -78,6 +163,63 @@ def _complete(content: list[dict[str, Any]], system: str, maxTokens: int = 1024)
         messages=[{"role": "user", "content": content}],
     )
     return "".join(b.text for b in response.content if getattr(b, "type", None) == "text")
+
+
+def _completeGemini(
+    system: str, userText: str, imageBytes: bytes | None, mediaType: str, maxTokens: int
+) -> str:
+    """One Gemini (google-genai) generate_content; vision when *imageBytes* is given.
+
+    Asks for ``application/json`` so the smart tools get a clean JSON reply.
+    """
+    from google import genai  # noqa: PLC0415 - optional dependency
+    from google.genai import types  # noqa: PLC0415 - optional dependency
+
+    from app.agents.gemini_keys import withRotationSync  # noqa: PLC0415 - avoid cycle
+
+    parts: list[Any] = [types.Part(text=userText)]
+    if imageBytes is not None:
+        parts.append(types.Part.from_bytes(data=imageBytes, mime_type=mediaType))
+
+    def _call(apiKey: str) -> str:
+        client = genai.Client(api_key=apiKey)
+        response = client.models.generate_content(
+            model=settings.geminiAiModel,
+            contents=[types.Content(role="user", parts=parts)],
+            config=types.GenerateContentConfig(
+                system_instruction=system,
+                temperature=0.0,
+                max_output_tokens=maxTokens,
+                response_mime_type="application/json",
+            ),
+        )
+        return response.text or ""
+
+    return withRotationSync(_call)
+
+
+def _completeOpenAI(
+    system: str, userText: str, imageBytes: bytes | None, mediaType: str, maxTokens: int
+) -> str:
+    """One OpenAI chat completion; vision (data-URI image) when *imageBytes* is given."""
+    import openai  # noqa: PLC0415 - optional dependency
+
+    userContent: list[dict[str, Any]] = [{"type": "text", "text": userText}]
+    if imageBytes is not None:
+        b64 = base64.b64encode(imageBytes).decode("ascii")
+        userContent.append(
+            {"type": "image_url", "image_url": {"url": f"data:{mediaType};base64,{b64}"}}
+        )
+    client = openai.OpenAI()
+    response = client.chat.completions.create(
+        model=settings.openaiAiModel,
+        max_tokens=maxTokens,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": userContent},
+        ],
+    )
+    return response.choices[0].message.content or ""
 
 
 def verifyGoal(goal: str, imageBytes: bytes, mediaType: str = "image/png") -> dict[str, Any]:
@@ -89,16 +231,15 @@ def verifyGoal(goal: str, imageBytes: bytes, mediaType: str = "image/png") -> di
         "screenshot. Reply with ONLY a JSON object: "
         '{"success": bool, "confidence": number 0..1, "reason": short string}.'
     )
-    content = [
-        {
-            "type": "image",
-            "source": {"type": "base64", "media_type": mediaType,
-                       "data": base64.b64encode(imageBytes).decode("ascii")},
-        },
-        {"type": "text", "text": f"Goal: {goal}\nIs this goal met? Reply with the JSON only."},
-    ]
     try:
-        data = _extractJson(_complete(content, system))
+        data = _extractJson(
+            _complete(
+                system,
+                f"Goal: {goal}\nIs this goal met? Reply with the JSON only.",
+                imageBytes=imageBytes,
+                mediaType=mediaType,
+            )
+        )
     except Exception as exc:  # noqa: BLE001
         return {"error": "Goal verification failed", "details": f"{type(exc).__name__}: {exc}",
                 "aiAvailable": True}
@@ -134,7 +275,7 @@ def findElement(description: str, candidates: list[dict[str, Any]]) -> dict[str,
         f"{json.dumps(candidates, ensure_ascii=False)}\n\nReply with the JSON only."
     )
     try:
-        data = _extractJson(_complete([{"type": "text", "text": prompt}], system))
+        data = _extractJson(_complete(system, prompt))
     except Exception as exc:  # noqa: BLE001
         return {"error": "Element finding failed", "details": f"{type(exc).__name__}: {exc}",
                 "aiAvailable": True}
@@ -171,7 +312,7 @@ def planActions(goal: str, context: dict[str, Any] | None = None) -> dict[str, A
         prompt += f"Page context (JSON):\n{json.dumps(context, ensure_ascii=False)[:4000]}\n"
     prompt += "Reply with the JSON array only."
     try:
-        steps = _extractJson(_complete([{"type": "text", "text": prompt}], system, maxTokens=2048))
+        steps = _extractJson(_complete(system, prompt, maxTokens=2048))
     except Exception as exc:  # noqa: BLE001
         return {"error": "Planning failed", "details": f"{type(exc).__name__}: {exc}",
                 "aiAvailable": True}

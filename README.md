@@ -1,6 +1,8 @@
 # AI Browser Controller
 
-A plug-and-play browser automation layer that lets any AI agent — primarily **Claude** — control a real browser. It can navigate to pages, inspect their UI/UX, take screenshots, record sessions to MP4, and report back **structured JSON** that an agent can reason over. The same browser-control surface is exposed three ways — a FastAPI HTTP + WebSocket server, an MCP stdio server, and in-process AI adapters — so you can drop it into a Claude Desktop config, a custom agent loop, or your own backend without rewriting anything.
+A plug-and-play browser automation layer that lets an AI agent control a real, automatable Chrome browser. It can navigate to pages, inspect their UI/UX, take screenshots, record sessions to MP4, and report back **structured JSON** that an agent can reason over. The same browser-control surface is exposed three ways — a FastAPI HTTP + WebSocket server, an MCP stdio server (for Claude Code/Desktop), and in-process AI adapters — so you can drop it into a Claude Desktop config, a custom agent loop, or your own backend without rewriting anything.
+
+**Who drives it:** Claude over MCP, **or** an in-process LLM that automates the web for you — **Gemini** (default), Claude, or OpenAI — via `python start.py agent "<task>"`. All three share one tool registry, so the browser behaves identically whichever brain is in control.
 
 ## Features
 
@@ -19,14 +21,14 @@ A plug-and-play browser automation layer that lets any AI agent — primarily **
 - **Browser-state snapshots** — `create_snapshot` / `restore_snapshot` save and restore cookies + localStorage + sessionStorage + open-tab URLs to JSON, so a session can be resumed without re-logging-in and re-navigating.
 - **Session replay (structured action log)** — distinct from video: `start_session` records every replayable action (click/fill/navigate/...) as JSON steps; `save_session` / `load_session` / `replay_session` reproduce a bug, build a workflow, or audit what was done.
 - **Named workflows** — `save_workflow` / `run_workflow` / `list_workflows` save a recorded session under a name and replay it later by name — no AI needed, fast and deterministic.
-- **AI judgment (Claude-backed)** — turns automation into *self-correcting* automation: `verify_goal` looks at a screenshot and judges whether a plain-language goal is met (`{success, confidence, reason}`); `find_element` / `click_by_description` locate an element from a description like "blue login button"; `plan_actions` returns an inspectable step plan. Needs the `anthropic` SDK + `ANTHROPIC_API_KEY`; degrades to a clear "unavailable" error otherwise.
+- **AI judgment (provider follows the driver)** — turns automation into *self-correcting* automation: `verify_goal` looks at a screenshot and judges whether a plain-language goal is met (`{success, confidence, reason}`); `find_element` / `click_by_description` locate an element from a description like "blue login button"; `plan_actions` returns an inspectable step plan. These reason with **whoever is driving** — a Gemini-driven run judges with Gemini, a Claude/Claude-Code run judges with Claude, OpenAI with OpenAI (set explicitly via `ABC_AI_PROVIDER`). Degrades to a clear "unavailable" error when that provider's SDK/key is absent.
 - **Browser memory** — `remember_page` stores a page's title/URL/structure/screenshot; `search_memory` recalls it later by keyword so the agent avoids re-scraping pages it has already seen.
 - **OCR** — `extract_text_from_screenshot` / `read_image` read text baked into images/canvas via Tesseract (optional dependency; honest error with install hints when absent).
 - **Browser session pool** — `create_session` / `list_sessions` / `switch_session` / `close_session` run several isolated browsers (own cookies/tabs/state) with one active at a time; every other tool drives the active session.
 - **Screen recording to MP4** — record a browser session and finalize it to a video file (ffmpeg-backed).
-- **MCP server** — every action is published as an MCP tool over stdio, so Claude Desktop (and any MCP client) can drive the browser directly.
+- **MCP server** — every action is published as an MCP tool over stdio, so Claude Desktop/Code (and any MCP client) can drive the browser directly.
 - **FastAPI + WebSocket** — a REST surface plus a persistent `/ws` socket that speaks the same action vocabulary.
-- **Claude & OpenAI adapters** — in-process adapters that map the browser actions to provider tool-calling so an agent can run an autonomous loop.
+- **Gemini / Claude / OpenAI adapters** — in-process adapters that map the browser actions to each provider's tool-calling so the LLM runs an autonomous loop. They all share one tool registry; run one with `python start.py agent --provider {gemini,claude,openai} "<task>"`.
 - **AI-friendly structured JSON** — every action, on every transport, returns the same success/error envelope so agents see one consistent contract.
 
 ## Architecture

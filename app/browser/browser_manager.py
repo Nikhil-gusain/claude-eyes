@@ -45,7 +45,13 @@ class BrowserManager:
     """Process-wide coordinator returning enveloped results for every action."""
 
     def __init__(self) -> None:
-        self.controller = PlaywrightController()
+        # The ACTIVE controller — the Playwright engine that drives a real,
+        # automatable Chrome/Chromium. Every action method calls
+        # ``self.controller.X(...)``, keeping the whole tool surface in one place.
+        self._playwrightController = PlaywrightController()
+        self.controller = self._playwrightController
+        # Retained for the ``status`` envelope; the controller is always Playwright.
+        self.backendName: str = "playwright"
         self.screenshots = ScreenshotManager()
         self.recorder = VideoRecorder()
         # Structured action log (replayable JSON), distinct from the video recorder.
@@ -153,11 +159,13 @@ class BrowserManager:
         }
 
     async def listProfiles(self) -> dict[str, Any]:
-        return await self._run(
-            "list_profiles",
-            lambda: self._async({"profiles": self.profiles.listProfiles(),
-                                 "active": self.profiles.getActiveProfile()}),
-        )
+        async def op() -> dict[str, Any]:
+            return {
+                "profiles": self.profiles.listProfiles(),
+                "active": self.profiles.getActiveProfile(),
+            }
+
+        return await self._run("list_profiles", op)
 
     async def selectProfile(self, name: str) -> dict[str, Any]:
         async def op() -> dict[str, Any]:
@@ -215,6 +223,25 @@ class BrowserManager:
             return snapshot
 
         return await self._run("login_session", op)
+
+    async def setStealth(self, enabled: bool) -> dict[str, Any]:
+        """Toggle stealth (anti-bot fingerprinting hardening) as a launch default."""
+        async def op() -> dict[str, Any]:
+            # Playwright applies stealth at launch from settings; update the
+            # in-memory default so the next launch honours the choice.
+            settings.stealth = enabled
+            return {"stealth": enabled, "backend": "playwright"}
+
+        return await self._run("set_stealth", op)
+
+    async def setHumanize(self, enabled: bool) -> dict[str, Any]:
+        """Toggle humanized (human-like) input as the default for click/fill/scroll."""
+        async def op() -> dict[str, Any]:
+            # Playwright reads the humanize default from settings per action.
+            settings.humanize = enabled
+            return {"humanize": enabled, "backend": "playwright"}
+
+        return await self._run("set_humanize", op)
 
     async def setHeadless(self, headless: bool) -> dict[str, Any]:
         """Switch a running browser between headless and headed (state preserved)."""
@@ -841,7 +868,7 @@ class BrowserManager:
         return await self._run("read_image", op)
 
     # ------------------------------------------------------------------ #
-    # AI judgment (Claude-backed): goal check, element finding, planning
+    # AI judgment (provider-backed): goal check, element finding, planning
     # ------------------------------------------------------------------ #
     async def verifyGoal(self, goal: str, fullPage: bool = False) -> dict[str, Any]:
         """Look at the current page and judge whether *goal* is visually met."""
@@ -888,7 +915,7 @@ class BrowserManager:
         return await self._run("click_by_description", op)
 
     async def planActions(self, goal: str, includeContext: bool = True) -> dict[str, Any]:
-        """Ask Claude for an ordered action plan to achieve *goal*."""
+        """Ask the active AI provider for an ordered action plan to achieve *goal*."""
         async def op() -> dict[str, Any]:
             context: dict[str, Any] | None = None
             if includeContext and self.controller.isRunning:
@@ -958,6 +985,7 @@ class BrowserManager:
     async def status(self) -> dict[str, Any]:
         async def op() -> dict[str, Any]:
             snapshot = self.controller._stateSnapshot()  # noqa: SLF001 - internal read
+            snapshot["backend"] = self.backendName
             snapshot["recording"] = self.recorder.isRecording
             snapshot["sessionRecording"] = self.session.recording
             snapshot["sessionSteps"] = len(self.session.steps)

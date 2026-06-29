@@ -1,1 +1,1 @@
-"""AI provider adapters (Claude / OpenAI) that map tools to the BrowserManager."""
+"""AI provider adapters (Claude / OpenAI / Gemini) that map tools to the BrowserManager."""

@@ -623,7 +623,7 @@ def createApp() -> FastAPI:
         return await getBrowserManager().readImage(command.source, lang=command.lang)
 
     # ----------------------------------------------------------------- #
-    # AI judgment (Claude-backed)
+    # AI judgment (provider-backed)
     # ----------------------------------------------------------------- #
     @app.post("/ai/verify-goal")
     async def verifyGoal(command: VerifyGoalCommand) -> dict:

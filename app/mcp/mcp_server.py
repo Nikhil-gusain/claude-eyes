@@ -98,8 +98,9 @@ async def openBrowser(
 async def listProfiles() -> dict[str, Any]:
     """List the available browser profiles and which one is currently active.
 
-    Use this to show the user their choices before opening a browser. Each
-    profile is an isolated Chrome "user" with its own logins/cookies.
+    Lists the managed Chrome user-data profiles. Use this to show the user their
+    choices before opening a browser. Each profile is an isolated "user" with its
+    own logins/cookies.
     """
     return await getBrowserManager().listProfiles()
 
@@ -109,9 +110,11 @@ async def listProfiles() -> dict[str, Any]:
 async def selectProfile(name: str) -> dict[str, Any]:
     """Set the active browser profile (remembered across chats).
 
+    Activates a managed user-data profile.
+
     Args:
         name: The profile to activate, or ``"random"`` to pick an existing one.
-            Creates the profile directory if it does not exist yet. After this,
+            Creates the profile if it does not exist yet. After this,
             ``open_browser``/``navigate`` use this profile until changed.
     """
     return await getBrowserManager().selectProfile(name)
@@ -120,7 +123,9 @@ async def selectProfile(name: str) -> dict[str, Any]:
 @mcp.tool(name="create_profile")
 @safeAsync(action="create_profile")
 async def createProfile(name: str, makeActive: bool = True) -> dict[str, Any]:
-    """Create a new, empty browser profile (a fresh Chrome "user").
+    """Create a new, empty browser profile (a fresh "user").
+
+    Creates a managed user-data directory.
 
     Args:
         name: Name for the new profile (slugified to letters/digits/_/-).
@@ -132,12 +137,12 @@ async def createProfile(name: str, makeActive: bool = True) -> dict[str, Any]:
 @mcp.tool(name="login_session")
 @safeAsync(action="login_session")
 async def loginSession(profile: str | None = None, url: str | None = None) -> dict[str, Any]:
-    """Open a VISIBLE browser on a profile so the USER can log in / sign up.
+    """Open a profile in a headed window so the USER can log in / sign up.
 
     Use this for sites that need a real human to authenticate (Google account,
     creating a new account, solving a captcha) before the agent can automate
-    them. The window opens headed; the user logs in; the session is saved into
-    the profile so all future automated runs are already logged in.
+    them. A headed window opens on the profile; the user logs in; the session is
+    saved into the persistent profile for all future automated runs.
 
     Args:
         profile: Profile to log into (or ``"random"``). If omitted and none is
@@ -145,6 +150,33 @@ async def loginSession(profile: str | None = None, url: str | None = None) -> di
         url: Optional URL to open for the login (e.g. the site's sign-in page).
     """
     return await getBrowserManager().loginSession(profile=profile, url=url)
+
+
+@mcp.tool(name="set_stealth")
+@safeAsync(action="set_stealth")
+async def setStealth(enabled: bool) -> dict[str, Any]:
+    """Toggle STEALTH (anti-bot fingerprinting hardening).
+
+    Updates the stealth default applied on the next browser launch.
+
+    Args:
+        enabled: ``True`` to enable stealth, ``False`` to disable it.
+    """
+    return await getBrowserManager().setStealth(enabled)
+
+
+@mcp.tool(name="set_humanize")
+@safeAsync(action="set_humanize")
+async def setHumanize(enabled: bool) -> dict[str, Any]:
+    """Toggle HUMANIZED input (human-like cursor/typing/scrolling) as the default.
+
+    Sets whether click/fill/scroll behave human-like by default (each of those
+    tools can still override per-call via their ``humanize`` argument).
+
+    Args:
+        enabled: ``True`` for human-like input by default, ``False`` for instant.
+    """
+    return await getBrowserManager().setHumanize(enabled)
 
 
 @mcp.tool(name="set_headless")
@@ -1056,7 +1088,7 @@ async def readImage(source: str, lang: str = "eng") -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------- #
-# AI judgment (Claude-backed): goal check, element finding, planning
+# AI judgment (provider-backed): goal check, element finding, planning
 # --------------------------------------------------------------------- #
 @mcp.tool(name="verify_goal")
 @safeAsync(action="verify_goal")
@@ -1065,8 +1097,9 @@ async def verifyGoal(goal: str, fullPage: bool = False) -> dict[str, Any]:
 
     Turns automation into self-correcting automation: e.g.
     ``verify_goal("the submit button is visible above the fold")`` returns
-    ``{success, confidence, reason}``. Needs the ``anthropic`` SDK and
-    ANTHROPIC_API_KEY; otherwise returns a clear unavailable error.
+    ``{success, confidence, reason}``. Uses the active AI provider (the driving
+    agent's — Gemini/Claude/OpenAI; default Claude); returns a clear unavailable
+    error if that provider's SDK or API key is missing.
 
     Args:
         goal: The condition to check, in plain language.
@@ -1081,8 +1114,8 @@ async def findElement(description: str, limit: int = 60) -> dict[str, Any]:
     """Find the element best matching a natural-language description.
 
     e.g. ``find_element("blue login button")`` returns a usable CSS ``selector``
-    plus confidence/reason — robust to markup you don't know in advance. Needs
-    Claude (SDK + ANTHROPIC_API_KEY).
+    plus confidence/reason — robust to markup you don't know in advance. Uses the
+    active AI provider (Gemini/Claude/OpenAI; default Claude).
 
     Args:
         description: What the element looks like / does, in plain language.
@@ -1098,7 +1131,8 @@ async def clickByDescription(
 ) -> dict[str, Any]:
     """Locate an element by description and CLICK it (find_element + click).
 
-    e.g. ``click_by_description("the accept cookies button")``. Needs Claude.
+    e.g. ``click_by_description("the accept cookies button")``. Uses the active
+    AI provider (Gemini/Claude/OpenAI; default Claude).
 
     Args:
         description: Plain-language description of the element to click.
@@ -1111,10 +1145,11 @@ async def clickByDescription(
 @mcp.tool(name="plan_actions")
 @safeAsync(action="plan_actions")
 async def planActions(goal: str, includeContext: bool = True) -> dict[str, Any]:
-    """Ask Claude for an ordered action PLAN to achieve a goal (inspect before run).
+    """Ask the AI for an ordered action PLAN to achieve a goal (inspect before run).
 
     Returns a JSON list of steps (action/target/value/why) so you can review the
-    approach before executing. Needs Claude (SDK + ANTHROPIC_API_KEY).
+    approach before executing. Uses the active AI provider (Gemini/Claude/OpenAI;
+    default Claude).
 
     Args:
         goal: The high-level objective to plan for.

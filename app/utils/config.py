@@ -134,9 +134,18 @@ class Settings:
         self.apiPort: int = _envInt("ABC_PORT", 8000)
 
         # ----- AI intelligence (vision goal-checks, element finding, planning) --
-        # Model used by the in-process "smart" tools that call Claude. Falls back
-        # to a clear error envelope when the SDK or ANTHROPIC_API_KEY is absent.
+        # Which provider backs the in-process "smart" tools (verify_goal /
+        # find_element / plan_actions): "claude", "gemini", or "openai". The
+        # in-process agent adapters OVERRIDE this at runtime so judgment uses
+        # whoever is driving; the MCP path (Claude Code) keeps this default. Each
+        # call falls back to a clear error envelope when the chosen provider's SDK
+        # or API key is absent.
+        self.aiProvider: str = os.getenv("ABC_AI_PROVIDER", "claude").lower()
+        # Per-provider judgment model. ``aiModel`` stays the Claude one for
+        # backward compatibility (``ABC_AI_MODEL``).
         self.aiModel: str = os.getenv("ABC_AI_MODEL", "claude-opus-4-8")
+        self.geminiAiModel: str = os.getenv("ABC_GEMINI_AI_MODEL", "gemini-2.5-flash")
+        self.openaiAiModel: str = os.getenv("ABC_OPENAI_AI_MODEL", "gpt-4o")
 
         # ----- Logging ------------------------------------------------------
         self.logLevel: str = os.getenv("ABC_LOG_LEVEL", "INFO").upper()

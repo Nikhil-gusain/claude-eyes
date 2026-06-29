@@ -299,7 +299,7 @@ def _buildDispatchTable() -> dict[str, DispatchFn]:
         "read_image": lambda manager, params: manager.readImage(
             params["source"], lang=params.get("lang", "eng")
         ),
-        # AI judgment (Claude-backed)
+        # AI judgment (provider-backed)
         "verify_goal": lambda manager, params: manager.verifyGoal(
             params["goal"], fullPage=params.get("fullPage", False)
         ),

@@ -45,3 +45,33 @@ def test_extractJsonArray() -> None:
 def test_extractJsonRaisesWhenNone() -> None:
     with pytest.raises(ValueError):
         intelligence._extractJson("no json here at all")
+
+
+def test_set_and_get_provider_roundtrip() -> None:
+    """The active judgment provider is settable and case-insensitive."""
+    original = intelligence.getAiProvider()
+    try:
+        intelligence.setAiProvider("gemini")
+        assert intelligence.getAiProvider() == "gemini"
+        intelligence.setAiProvider("OpenAI")
+        assert intelligence.getAiProvider() == "openai"
+        # Empty falls back to the configured default.
+        intelligence.setAiProvider("")
+        assert intelligence.getAiProvider() == intelligence.settings.aiProvider
+    finally:
+        intelligence.setAiProvider(original)
+
+
+def test_unavailable_envelope_names_active_provider(monkeypatch) -> None:
+    """When the active provider isn't ready, the envelope says which one."""
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    original = intelligence.getAiProvider()
+    try:
+        intelligence.setAiProvider("gemini")
+        envelope = intelligence._unavailable()
+        assert envelope["provider"] == "gemini"
+        assert envelope["aiAvailable"] is False
+        assert "google-genai" in envelope["details"] or "GEMINI_API_KEY" in envelope["details"]
+    finally:
+        intelligence.setAiProvider(original)

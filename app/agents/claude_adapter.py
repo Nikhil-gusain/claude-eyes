@@ -24,6 +24,7 @@ import json
 import os
 from typing import Any
 
+from app.browser import intelligence
 from app.browser.browser_manager import getBrowserManager
 from app.browser.session_pool import (
     closeSession,
@@ -38,6 +39,22 @@ logger = getLogger("agents.claude")
 
 # Default model for this adapter. Adaptive thinking is enabled on every call.
 DEFAULT_CLAUDE_MODEL = "claude-opus-4-8"
+
+# System prompt for the agentic loop. The tools drive a real, automatable
+# Chrome/Chromium via Playwright.
+SYSTEM_PROMPT = (
+    "You drive a real, automatable Chrome browser through these tools to complete "
+    "the user's task. Work in small steps: read the page (read_page / extract_* / "
+    "get_dom) to see what's there, then act (navigate, click, fill, scroll, "
+    "press_keys), and verify the result before moving on. Prefer precise CSS "
+    "selectors from what you actually observed over guessing.\n\n"
+    "When a site needs a real human to log in or sign up (credentials, a captcha, "
+    "a one-time code), do NOT try to type the user's secrets yourself: call "
+    "login_session (optionally with the sign-in url and a profile) to open a "
+    "headed window for the user to authenticate, then continue once they are "
+    "logged in. Use set_stealth and set_humanize to control anti-bot stealth and "
+    "human-like input defaults. Stop when the task is done and report what you found."
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -92,6 +109,31 @@ TOOL_SPECS: list[dict[str, Any]] = [
         "name": "clear_profile",
         "description": "Wipe the persistent profile — logs out of everything for a fresh session (deletes all saved cookies/tokens).",
         "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+    # ------------------------------------------------------------------ #
+    # Stealth / human-like input controls
+    # ------------------------------------------------------------------ #
+    {
+        "name": "set_stealth",
+        "description": "Toggle STEALTH (anti-bot fingerprinting hardening). Updates the stealth default applied on the next browser launch.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "enabled": {"type": "boolean", "description": "true to enable stealth, false to disable."},
+            },
+            "required": ["enabled"],
+        },
+    },
+    {
+        "name": "set_humanize",
+        "description": "Toggle HUMANIZED input (human-like cursor/typing/scrolling) as the default for click/fill/scroll (each tool can still override per-call).",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "enabled": {"type": "boolean", "description": "true for human-like input by default, false for instant."},
+            },
+            "required": ["enabled"],
+        },
     },
     # ------------------------------------------------------------------ #
     # Navigation
@@ -660,7 +702,7 @@ TOOL_SPECS: list[dict[str, Any]] = [
         },
     },
     # ------------------------------------------------------------------ #
-    # AI judgment (Claude-backed): goal check, element finding, planning
+    # AI judgment (provider-backed): goal check, element finding, planning
     # ------------------------------------------------------------------ #
     {
         "name": "verify_goal",
@@ -809,6 +851,10 @@ async def dispatchTool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         return await manager.setHeadless(arguments.get("headless", True))
     if name == "clear_profile":
         return await manager.clearProfile()
+    if name == "set_stealth":
+        return await manager.setStealth(arguments["enabled"])
+    if name == "set_humanize":
+        return await manager.setHumanize(arguments["enabled"])
     if name == "navigate":
         return await manager.navigate(
             url=arguments["url"],
@@ -1076,6 +1122,10 @@ class ClaudeAdapter:
                 "calling runConversation()."
             )
 
+        # Judgment tools (verify_goal / find_element / plan_actions) this run
+        # invokes should reason with Claude too — match the driver.
+        intelligence.setAiProvider("claude")
+
         # Reads ANTHROPIC_API_KEY from the environment.
         client = anthropic.Anthropic()
 
@@ -1091,6 +1141,7 @@ class ClaudeAdapter:
                 model=self.model,
                 max_tokens=16000,
                 thinking={"type": "adaptive"},
+                system=SYSTEM_PROMPT,
                 tools=tools,
                 messages=messages,
             )
