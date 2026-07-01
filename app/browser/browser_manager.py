@@ -184,6 +184,12 @@ class BrowserManager:
             self._guard(lambda: self.controller.fillInput(selector, value, clearFirst, timeoutMs)),
         )
 
+    async def selectOption(self, selector: str, value: str | None = None, label: str | None = None, timeoutMs: int | None = None) -> dict[str, Any]:
+        return await self._run(
+            "select_option",
+            self._guard(lambda: self.controller.selectOption(selector, value, label, timeoutMs)),
+        )
+
     async def uploadFile(self, selector: str, filePaths: list[str]) -> dict[str, Any]:
         return await self._run("upload_file", self._guard(lambda: self.controller.uploadFile(selector, filePaths)))
 

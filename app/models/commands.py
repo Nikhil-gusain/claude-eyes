@@ -54,6 +54,15 @@ class HoverCommand(BaseModel):
     timeoutMs: Optional[int] = Field(default=None, ge=0, le=300_000)
 
 
+class SelectCommand(BaseModel):
+    """Choose an <option> in a native <select> by value or visible label."""
+
+    selector: str
+    value: Optional[str] = None
+    label: Optional[str] = None
+    timeoutMs: Optional[int] = Field(default=None, ge=0, le=300_000)
+
+
 class ScrollCommand(BaseModel):
     """Scroll by a pixel delta, to an element, or to an absolute position."""
 

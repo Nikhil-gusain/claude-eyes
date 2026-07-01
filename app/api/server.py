@@ -39,6 +39,7 @@ from app.models.commands import (
     RecordingCommand,
     ScreenshotCommand,
     ScrollCommand,
+    SelectCommand,
     TabCommand,
     UploadCommand,
     WaitForElementCommand,
@@ -294,6 +295,13 @@ def createApp() -> FastAPI:
     async def pressKeys(command: PressKeysCommand) -> dict:
         logger.info("Request: press_keys -> %s", command.keys)
         return await getBrowserManager().pressKeys(command.keys, selector=command.selector)
+
+    @app.post("/interact/select")
+    async def selectOption(command: SelectCommand) -> dict:
+        logger.info("Request: select_option -> %s", command.selector)
+        return await getBrowserManager().selectOption(
+            command.selector, value=command.value, label=command.label, timeoutMs=command.timeoutMs
+        )
 
     @app.post("/interact/upload")
     async def uploadFile(command: UploadCommand) -> dict:

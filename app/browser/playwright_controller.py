@@ -516,6 +516,23 @@ class PlaywrightController:
             await page.type(selector, value)
         return {"filled": selector, "value": value}
 
+    async def selectOption(
+        self,
+        selector: str,
+        value: str | None = None,
+        label: str | None = None,
+        timeoutMs: int | None = None,
+    ) -> dict[str, Any]:
+        page = self.activePage
+        timeout = timeoutMs or settings.defaultTimeoutMs
+        if label is not None:
+            chosen = await page.select_option(selector, label=label, timeout=timeout)
+        elif value is not None:
+            chosen = await page.select_option(selector, value=value, timeout=timeout)
+        else:
+            raise ValueError("selectOption requires 'value' or 'label'")
+        return {"selected": chosen, "selector": selector}
+
     async def uploadFile(self, selector: str, filePaths: list[str]) -> dict[str, Any]:
         missing = [p for p in filePaths if not Path(p).exists()]
         if missing:
