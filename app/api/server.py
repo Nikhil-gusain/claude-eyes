@@ -792,6 +792,13 @@ def createApp() -> FastAPI:
     # ----------------------------------------------------------------- #
     registerWebSocket(app)
 
+    # ----------------------------------------------------------------- #
+    # Studio dashboard — live thinking window + mid-task steering (GET /studio)
+    # ----------------------------------------------------------------- #
+    from app.api.studio import router as studioRouter
+
+    app.include_router(studioRouter)
+
     return app
 
 

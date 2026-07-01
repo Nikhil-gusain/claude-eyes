@@ -65,6 +65,7 @@ def test_set_and_get_provider_roundtrip() -> None:
 def test_unavailable_envelope_names_active_provider(monkeypatch) -> None:
     """When the active provider isn't ready, the envelope says which one."""
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GEMINI_API_KEYS", raising=False)
     monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
     original = intelligence.getAiProvider()
     try:

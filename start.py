@@ -47,6 +47,16 @@ def runApi(_args: argparse.Namespace) -> int:
     return 0
 
 
+def runStudio(_args: argparse.Namespace) -> int:
+    """Run the web server and point the user at the Studio dashboard."""
+    logger.info(
+        "Browser Agent Studio: open http://%s:%d/studio",
+        settings.apiHost,
+        settings.apiPort,
+    )
+    return runApi(_args)
+
+
 def runMcp(_args: argparse.Namespace) -> int:
     """Run the MCP stdio server."""
     logger.info(
@@ -147,10 +157,16 @@ def buildParser() -> argparse.ArgumentParser:
         prog="start.py",
         description="AI Browser Controller — let any AI agent drive a real browser.",
     )
-    subparsers = parser.add_subparsers(dest="command", metavar="{api,mcp,agent,info}")
+    subparsers = parser.add_subparsers(dest="command", metavar="{api,studio,mcp,agent,info}")
 
     apiParser = subparsers.add_parser("api", help="Run the FastAPI HTTP + WebSocket server.")
     apiParser.set_defaults(handler=runApi)
+
+    studioParser = subparsers.add_parser(
+        "studio",
+        help="Run the web server with the Studio dashboard (live thinking window + steering).",
+    )
+    studioParser.set_defaults(handler=runStudio)
 
     mcpParser = subparsers.add_parser("mcp", help="Run the MCP stdio server.")
     mcpParser.set_defaults(handler=runMcp)

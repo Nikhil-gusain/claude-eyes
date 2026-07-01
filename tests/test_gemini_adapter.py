@@ -90,6 +90,7 @@ def test_schema_translation_uppercases_types_and_keeps_constraints() -> None:
 async def test_run_conversation_requires_sdk_or_key(monkeypatch) -> None:
     """Without the SDK or a key, the loop raises a clear RuntimeError."""
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GEMINI_API_KEYS", raising=False)
     monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
     with pytest.raises(RuntimeError) as excinfo:
         await GeminiAdapter().runConversation("do nothing", maxTurns=1)

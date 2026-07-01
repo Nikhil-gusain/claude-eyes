@@ -53,7 +53,15 @@ SYSTEM_PROMPT = (
     "login_session (optionally with the sign-in url and a profile) to open a "
     "headed window for the user to authenticate, then continue once they are "
     "logged in. Use set_stealth and set_humanize to control anti-bot stealth and "
-    "human-like input defaults. Stop when the task is done and report what you found."
+    "human-like input defaults. Stop when the task is done and report what you found.\n\n"
+    "Go to the site the user actually named. When they refer to an app or service "
+    "colloquially, navigate straight to its canonical site — e.g. \"chat gpt\" / "
+    "\"chatgpt\" -> https://chatgpt.com, \"google\" -> https://google.com, "
+    "\"youtube\" -> https://youtube.com. Do the task ON that site. Do NOT substitute "
+    "a different company's product or a look-alike: a ChatGPT task does not belong on "
+    "openai.com/dall-e, huggingface.co, or any other provider unless the user "
+    "explicitly asks for it. If the named site can't do what's asked, say so rather "
+    "than silently wandering to a different one."
 )
 
 

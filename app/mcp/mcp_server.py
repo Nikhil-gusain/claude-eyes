@@ -542,8 +542,9 @@ async def fill(
 ) -> dict[str, Any]:
     """Type ``value`` into the input/textarea matched by ``selector``.
 
-    By default typing is HUMAN-PACED (~25 WPM with natural jitter and the odd
-    pause) and the field is reached by moving the cursor there and clicking to
+    By default typing is HUMAN-PACED (~90 WPM with natural jitter and the odd
+    pause; tune with ABC_TYPING_WPM) and the field is reached by moving the
+    cursor there and clicking to
     focus — so it does not look like a machine pasted the whole string at once.
 
     Args:

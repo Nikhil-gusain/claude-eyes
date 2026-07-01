@@ -115,7 +115,10 @@ class Settings:
         # cursor travels a curved, wiggling path before clicking, and scrolling
         # is incremental rather than an instant jump. Disable for raw speed.
         self.humanize: bool = _envBool("ABC_HUMANIZE", True)
-        self.typingWpm: int = _envInt("ABC_TYPING_WPM", 25)
+        # Typing speed in words/min. Default 90 = a brisk, fluent human typist
+        # (≈80-100 WPM). Lower it (e.g. 25) to look like a slow hunt-and-peck
+        # typist, raise it toward 1000 for near-instant. Tune via ABC_TYPING_WPM.
+        self.typingWpm: int = _envInt("ABC_TYPING_WPM", 90)
         # Stealth shrinks the *automation fingerprint* (navigator.webdriver, the
         # --enable-automation switch, the "controlled by automated software"
         # banner, missing window.chrome). Humanization covers behaviour; this
