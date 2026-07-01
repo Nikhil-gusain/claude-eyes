@@ -47,21 +47,94 @@ class Settings:
         self.recordingDir: Path = Path(
             os.getenv("ABC_RECORDING_DIR", str(self.storageDir / "recordings"))
         )
+        # Structured-action sessions (replayable JSON), browser-state snapshots
+        # (cookies + storage + open tabs), and visual-diff outputs each get their
+        # own folder under ``storageDir`` so artifacts stay tidy and separable.
+        self.sessionDir: Path = Path(
+            os.getenv("ABC_SESSION_DIR", str(self.storageDir / "sessions"))
+        )
+        self.snapshotDir: Path = Path(
+            os.getenv("ABC_SNAPSHOT_DIR", str(self.storageDir / "snapshots"))
+        )
+        self.diffDir: Path = Path(
+            os.getenv("ABC_DIFF_DIR", str(self.storageDir / "diffs"))
+        )
+        # Page memory (a small searchable store of pages the agent has seen) and
+        # named workflows (saved sessions runnable by name).
+        self.memoryDir: Path = Path(
+            os.getenv("ABC_MEMORY_DIR", str(self.storageDir / "memory"))
+        )
+        self.memoryFile: Path = Path(
+            os.getenv("ABC_MEMORY_FILE", str(self.storageDir / "memory" / "pages.json"))
+        )
+        self.workflowDir: Path = Path(
+            os.getenv("ABC_WORKFLOW_DIR", str(self.storageDir / "workflows"))
+        )
+        # Website Skill System — persistent, per-domain operational knowledge the
+        # browser builds up over visits (routes/, workflows/, assets/ + JSON
+        # indexes). Distinct from page memory: memory stores *what a page was*,
+        # skills store *how a site works*. Everything lives under one root keyed
+        # by domain so no site can read another's skills.
+        self.discoveryStorage: Path = Path(
+            os.getenv("ABC_DISCOVERY_STORAGE", str(self.storageDir / "website_skills"))
+        )
         # Persistent browser profile (cookies, tokens, localStorage). Reusing one
-        # directory across runs keeps the user logged into sites like Gmail.
+        # directory across runs keeps the user logged into sites like Gmail. This
+        # stays the *default* profile path; named multi-profiles live under
+        # ``profilesDir`` (see below) and are resolved by ``ProfileManager``.
         self.userDataDir: Path = Path(
             os.getenv("ABC_USER_DATA_DIR", str(self.storageDir / "browser_profile"))
+        )
+        # Root holding one persistent user-data dir per named profile, plus the
+        # small JSON pointer recording which profile is currently active. The
+        # active choice survives process restarts so the same profile reopens for
+        # the user even after a chat ends and a new prompt starts.
+        self.profilesDir: Path = Path(
+            os.getenv("ABC_PROFILES_DIR", str(self.storageDir / "profiles"))
+        )
+        self.activeProfileFile: Path = Path(
+            os.getenv("ABC_ACTIVE_PROFILE_FILE", str(self.storageDir / "active_profile.json"))
         )
 
         # ----- Browser defaults --------------------------------------------
         self.browserType: Literal["chromium", "firefox", "webkit"] = os.getenv(
             "ABC_BROWSER", "chromium"
         )  # type: ignore[assignment]
+        # Optional real-browser channel (e.g. "chrome", "msedge"). Driving the
+        # user's installed Chrome instead of bundled Chromium is harder for
+        # bot-detection to flag; ``None`` uses Playwright's bundled engine.
+        self.browserChannel: str | None = os.getenv("ABC_BROWSER_CHANNEL") or None
         self.headless: bool = _envBool("ABC_HEADLESS", True)
         self.viewportWidth: int = _envInt("ABC_VIEWPORT_WIDTH", 1280)
         self.viewportHeight: int = _envInt("ABC_VIEWPORT_HEIGHT", 800)
         self.defaultTimeoutMs: int = _envInt("ABC_TIMEOUT_MS", 30_000)
         self.userAgent: str | None = os.getenv("ABC_USER_AGENT") or None
+
+        # ----- Humanization (anti bot-detection) ---------------------------
+        # When on, typing is paced (~``typingWpm`` words/min with jitter), the
+        # cursor travels a curved, wiggling path before clicking, and scrolling
+        # is incremental rather than an instant jump. Disable for raw speed.
+        self.humanize: bool = _envBool("ABC_HUMANIZE", True)
+        # Typing speed in words/min. Default 90 = a brisk, fluent human typist
+        # (≈80-100 WPM). Lower it (e.g. 25) to look like a slow hunt-and-peck
+        # typist, raise it toward 1000 for near-instant. Tune via ABC_TYPING_WPM.
+        self.typingWpm: int = _envInt("ABC_TYPING_WPM", 90)
+        # Stealth shrinks the *automation fingerprint* (navigator.webdriver, the
+        # --enable-automation switch, the "controlled by automated software"
+        # banner, missing window.chrome). Humanization covers behaviour; this
+        # covers the fingerprint hardened sites read. Best with channel=chrome.
+        self.stealth: bool = _envBool("ABC_STEALTH", True)
+
+        # ----- Event-driven waiting ----------------------------------------
+        # Hard ceiling for "wait quietly for a slow thing" (e.g. an online AI's
+        # streamed answer). Downloads may legitimately take far longer.
+        self.maxWaitMs: int = _envInt("ABC_MAX_WAIT_MS", 300_000)  # 5 minutes
+        self.maxDownloadWaitMs: int = _envInt("ABC_MAX_DOWNLOAD_WAIT_MS", 3_600_000)  # 1 hour
+
+        # ----- No-image mode (MarkItDown) ----------------------------------
+        # When on, the browser favours text: pixel screenshots are suppressed and
+        # media (images/PDF/…) is converted to markdown via MarkItDown instead.
+        self.noImageMode: bool = _envBool("ABC_NO_IMAGE_MODE", False)
 
         # ----- Recording defaults ------------------------------------------
         self.recordingFps: int = _envInt("ABC_RECORDING_FPS", 24)
@@ -71,6 +144,33 @@ class Settings:
         self.apiHost: str = os.getenv("ABC_HOST", "127.0.0.1")
         self.apiPort: int = _envInt("ABC_PORT", 8000)
 
+        # ----- AI intelligence (vision goal-checks, element finding, planning) --
+        # Which provider backs the in-process "smart" tools (verify_goal /
+        # find_element / plan_actions): "claude", "gemini", or "openai". The
+        # in-process agent adapters OVERRIDE this at runtime so judgment uses
+        # whoever is driving; the MCP path (Claude Code) keeps this default. Each
+        # call falls back to a clear error envelope when the chosen provider's SDK
+        # or API key is absent.
+        self.aiProvider: str = os.getenv("ABC_AI_PROVIDER", "claude").lower()
+        # Per-provider judgment model. ``aiModel`` stays the Claude one for
+        # backward compatibility (``ABC_AI_MODEL``).
+        self.aiModel: str = os.getenv("ABC_AI_MODEL", "claude-opus-4-8")
+        self.geminiAiModel: str = os.getenv("ABC_GEMINI_AI_MODEL", "gemini-2.5-flash")
+        self.openaiAiModel: str = os.getenv("ABC_OPENAI_AI_MODEL", "gpt-4o")
+
+        # ----- Website Skill System (discovery) ----------------------------
+        # Mode gates reads/writes of skills: OFF (disabled), READ_ONLY (read but
+        # never modify/create), LEARN (read + discover + update + create — the
+        # default). Confidence threshold is the floor below which a known route is
+        # auto-rediscovered; autoUpdate enables that automatic relearning on
+        # navigation; maxDepth bounds whole-site crawls.
+        self.discoveryMode: str = os.getenv("ABC_DISCOVERY_MODE", "LEARN").upper()
+        self.discoveryConfidenceThreshold: int = _envInt(
+            "ABC_DISCOVERY_CONFIDENCE_THRESHOLD", 50
+        )
+        self.discoveryAutoUpdate: bool = _envBool("ABC_DISCOVERY_AUTO_UPDATE", True)
+        self.discoveryMaxDepth: int = _envInt("ABC_DISCOVERY_MAX_DEPTH", 2)
+
         # ----- Logging ------------------------------------------------------
         self.logLevel: str = os.getenv("ABC_LOG_LEVEL", "INFO").upper()
 
@@ -78,14 +178,32 @@ class Settings:
         """Return a JSON-serialisable snapshot of the active settings."""
         return {
             "browserType": self.browserType,
+            "browserChannel": self.browserChannel,
             "headless": self.headless,
             "viewportWidth": self.viewportWidth,
             "viewportHeight": self.viewportHeight,
             "defaultTimeoutMs": self.defaultTimeoutMs,
+            "humanize": self.humanize,
+            "typingWpm": self.typingWpm,
+            "stealth": self.stealth,
+            "maxWaitMs": self.maxWaitMs,
+            "maxDownloadWaitMs": self.maxDownloadWaitMs,
+            "noImageMode": self.noImageMode,
             "recordingFps": self.recordingFps,
             "screenshotDir": str(self.screenshotDir),
             "recordingDir": str(self.recordingDir),
+            "sessionDir": str(self.sessionDir),
+            "snapshotDir": str(self.snapshotDir),
+            "diffDir": str(self.diffDir),
+            "memoryDir": str(self.memoryDir),
+            "workflowDir": str(self.workflowDir),
+            "discoveryStorage": str(self.discoveryStorage),
+            "discoveryMode": self.discoveryMode,
+            "discoveryConfidenceThreshold": self.discoveryConfidenceThreshold,
+            "discoveryAutoUpdate": self.discoveryAutoUpdate,
+            "discoveryMaxDepth": self.discoveryMaxDepth,
             "userDataDir": str(self.userDataDir),
+            "profilesDir": str(self.profilesDir),
             "apiHost": self.apiHost,
             "apiPort": self.apiPort,
             "logLevel": self.logLevel,

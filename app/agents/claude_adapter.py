@@ -24,7 +24,14 @@ import json
 import os
 from typing import Any
 
+from app.browser import intelligence
 from app.browser.browser_manager import getBrowserManager
+from app.browser.session_pool import (
+    closeSession,
+    createSession,
+    listSessions,
+    switchSession,
+)
 from app.utils.error_handler import safeAsync
 from app.utils.logger import getLogger
 
@@ -32,6 +39,30 @@ logger = getLogger("agents.claude")
 
 # Default model for this adapter. Adaptive thinking is enabled on every call.
 DEFAULT_CLAUDE_MODEL = "claude-opus-4-8"
+
+# System prompt for the agentic loop. The tools drive a real, automatable
+# Chrome/Chromium via Playwright.
+SYSTEM_PROMPT = (
+    "You drive a real, automatable Chrome browser through these tools to complete "
+    "the user's task. Work in small steps: read the page (read_page / extract_* / "
+    "get_dom) to see what's there, then act (navigate, click, fill, scroll, "
+    "press_keys), and verify the result before moving on. Prefer precise CSS "
+    "selectors from what you actually observed over guessing.\n\n"
+    "When a site needs a real human to log in or sign up (credentials, a captcha, "
+    "a one-time code), do NOT try to type the user's secrets yourself: call "
+    "login_session (optionally with the sign-in url and a profile) to open a "
+    "headed window for the user to authenticate, then continue once they are "
+    "logged in. Use set_stealth and set_humanize to control anti-bot stealth and "
+    "human-like input defaults. Stop when the task is done and report what you found.\n\n"
+    "Go to the site the user actually named. When they refer to an app or service "
+    "colloquially, navigate straight to its canonical site — e.g. \"chat gpt\" / "
+    "\"chatgpt\" -> https://chatgpt.com, \"google\" -> https://google.com, "
+    "\"youtube\" -> https://youtube.com. Do the task ON that site. Do NOT substitute "
+    "a different company's product or a look-alike: a ChatGPT task does not belong on "
+    "openai.com/dall-e, huggingface.co, or any other provider unless the user "
+    "explicitly asks for it. If the named site can't do what's asked, say so rather "
+    "than silently wandering to a different one."
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -86,6 +117,31 @@ TOOL_SPECS: list[dict[str, Any]] = [
         "name": "clear_profile",
         "description": "Wipe the persistent profile — logs out of everything for a fresh session (deletes all saved cookies/tokens).",
         "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+    # ------------------------------------------------------------------ #
+    # Stealth / human-like input controls
+    # ------------------------------------------------------------------ #
+    {
+        "name": "set_stealth",
+        "description": "Toggle STEALTH (anti-bot fingerprinting hardening). Updates the stealth default applied on the next browser launch.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "enabled": {"type": "boolean", "description": "true to enable stealth, false to disable."},
+            },
+            "required": ["enabled"],
+        },
+    },
+    {
+        "name": "set_humanize",
+        "description": "Toggle HUMANIZED input (human-like cursor/typing/scrolling) as the default for click/fill/scroll (each tool can still override per-call).",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "enabled": {"type": "boolean", "description": "true for human-like input by default, false for instant."},
+            },
+            "required": ["enabled"],
+        },
     },
     # ------------------------------------------------------------------ #
     # Navigation
@@ -456,6 +512,431 @@ TOOL_SPECS: list[dict[str, Any]] = [
             "required": [],
         },
     },
+    # ------------------------------------------------------------------ #
+    # Tab intelligence
+    # ------------------------------------------------------------------ #
+    {
+        "name": "get_tabs",
+        "description": "Summarise every open tab (index, title, URL, host, which is active). Use it to keep track of many tabs.",
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+    # ------------------------------------------------------------------ #
+    # Accessibility & visual QA
+    # ------------------------------------------------------------------ #
+    {
+        "name": "get_accessibility_tree",
+        "description": "Return the page's accessibility tree (roles/names a screen reader sees) — often clearer than raw HTML for understanding structure.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "interestingOnly": {"type": "boolean", "description": "Prune presentational nodes (default true)."},
+                "root": {"type": "string", "description": "Optional CSS selector to scope the snapshot."},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "audit_page",
+        "description": "Audit the page for UI defects: horizontal overflow, hidden interactive elements, broken images, and low text contrast. Returns counts plus samples.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "sampleLimit": {"type": "integer", "description": "Max text elements the contrast pass inspects."},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "compare_screenshots",
+        "description": "Compare two screenshot files and quantify what changed: visualDifferencePercent and changedRegions with bounding boxes. Use before/after take_screenshot files.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "before": {"type": "string", "description": "Path to the baseline screenshot."},
+                "after": {"type": "string", "description": "Path to the screenshot to compare."},
+                "pixelThreshold": {"type": "integer", "description": "Per-pixel change sensitivity (0-765)."},
+                "saveDiff": {"type": "boolean", "description": "Also write a change-mask PNG and return its path."},
+            },
+            "required": ["before", "after"],
+        },
+    },
+    # ------------------------------------------------------------------ #
+    # Browser-state snapshot (cookies + storage + open tabs)
+    # ------------------------------------------------------------------ #
+    {
+        "name": "create_snapshot",
+        "description": "Capture the full browser state (cookies, localStorage, sessionStorage, open-tab URLs) to a JSON file for later restore.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "savePath": {"type": "string", "description": "Optional output path; omit to auto-name."},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "restore_snapshot",
+        "description": "Restore cookies + storage from a snapshot file made by create_snapshot (navigates to the snapshot URL first).",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Path to a snapshot JSON from create_snapshot."},
+                "navigate": {"type": "boolean", "description": "Re-open the snapshot URL before restoring storage (default true)."},
+            },
+            "required": ["path"],
+        },
+    },
+    # ------------------------------------------------------------------ #
+    # Session replay (structured, replayable action log — not video)
+    # ------------------------------------------------------------------ #
+    {
+        "name": "start_session",
+        "description": "Start recording replayable actions (click/fill/navigate/...) as structured JSON steps. Unlike start_recording (video), this is machine-replayable.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Optional session name; omit to auto-generate."},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "stop_session",
+        "description": "Stop the structured action recording and return the captured steps.",
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "save_session",
+        "description": "Save the recorded session to a JSON file for later load/replay.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Optional output path; omit to auto-name."},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "load_session",
+        "description": "Load a previously saved session JSON into memory, ready to replay.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Path to a session JSON saved by save_session."},
+            },
+            "required": ["path"],
+        },
+    },
+    {
+        "name": "replay_session",
+        "description": "Replay a recorded session's steps in order against the live browser. Loads 'path' first if given, else replays the in-memory session.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Optional session JSON to load before replaying."},
+                "delayMs": {"type": "integer", "description": "Pause between steps in milliseconds (default 500)."},
+                "continueOnError": {"type": "boolean", "description": "Keep going after a failed step (default true)."},
+            },
+            "required": [],
+        },
+    },
+    # ------------------------------------------------------------------ #
+    # Browser memory
+    # ------------------------------------------------------------------ #
+    {
+        "name": "remember_page",
+        "description": "Save the CURRENT page into memory (title, URL, structure, screenshot) so you can recall it later without re-scraping.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "tags": {"type": "array", "items": {"type": "string"}, "description": "Optional labels to attach."},
+                "withScreenshot": {"type": "boolean", "description": "Also store a screenshot (default true)."},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "search_memory",
+        "description": "Recall remembered pages matching a query (keyword-ranked). Avoids re-visiting pages you've already seen.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Words to match against remembered pages."},
+                "limit": {"type": "integer", "description": "Max matches to return (default 10)."},
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "list_memory",
+        "description": "List the most recently remembered pages.",
+        "parameters": {
+            "type": "object",
+            "properties": {"limit": {"type": "integer", "description": "Max pages to list (default 50)."}},
+            "required": [],
+        },
+    },
+    {
+        "name": "clear_memory",
+        "description": "Forget all remembered pages.",
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+    # ------------------------------------------------------------------ #
+    # Website Skill System (persistent per-domain operational knowledge)
+    # ------------------------------------------------------------------ #
+    {
+        "name": "discover_page",
+        "description": "Learn how the CURRENT page works (or navigate to 'url' first): purpose, UI, forms, navigation, inferred workflows. Saves a persistent route skill (LEARN mode). Safe & read-only — never clicks destructive controls.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "Optional URL to navigate to before discovering."},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "discover_website",
+        "description": "Crawl internal routes from the current/start page (depth-bounded, safe) and learn a skill for each. Follows GET-like internal links only; never submits forms or clicks destructive UI.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "startUrl": {"type": "string", "description": "Optional URL to start from."},
+                "maxPages": {"type": "integer", "description": "Max pages to visit (default 10, hard cap 50)."},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "update_skill",
+        "description": "Record an outcome for a route's skill to tune its confidence. Pass success=true after a flow worked, success=false after it failed, or an explicit confidenceDelta. Low confidence triggers auto-rediscovery.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "URL of the route whose skill to update."},
+                "success": {"type": "boolean", "description": "true bumps confidence, false drops it."},
+                "confidenceDelta": {"type": "integer", "description": "Explicit confidence change (overrides success)."},
+            },
+            "required": ["url"],
+        },
+    },
+    {
+        "name": "list_skills",
+        "description": "List learned websites, or one domain's routes + workflows. Reads JSON indexes only (never scans folders).",
+        "parameters": {
+            "type": "object",
+            "properties": {"domain": {"type": "string", "description": "Optional domain (e.g. 'github.com') to drill into."}},
+            "required": [],
+        },
+    },
+    {
+        "name": "search_skills",
+        "description": "Keyword-search learned skills across domains/routes via the JSON indexes.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Words to match against domains/routes/titles."},
+                "limit": {"type": "integer", "description": "Max results (default 20)."},
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "export_skills",
+        "description": "Export learned skills (one domain or all) as a portable bundle, optionally writing to a file.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "domain": {"type": "string", "description": "Optional single domain to export."},
+                "savePath": {"type": "string", "description": "Optional file path to write the bundle to."},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "import_skills",
+        "description": "Import a skills bundle (inline 'bundle' dict or from 'path'). Skips existing files unless overwrite=true.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "bundle": {"type": "object", "description": "Inline bundle from export_skills."},
+                "path": {"type": "string", "description": "Path to a bundle JSON file."},
+                "overwrite": {"type": "boolean", "description": "Overwrite existing skill files (default false)."},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "clear_skills",
+        "description": "Forget one domain's skills (pass 'domain'), or wipe the entire skill store.",
+        "parameters": {
+            "type": "object",
+            "properties": {"domain": {"type": "string", "description": "Optional domain to clear; omit to wipe all."}},
+            "required": [],
+        },
+    },
+    {
+        "name": "set_discovery_mode",
+        "description": "Set the Website Skill System mode: OFF (disabled), READ_ONLY (read but never modify), or LEARN (read + discover + update — default).",
+        "parameters": {
+            "type": "object",
+            "properties": {"mode": {"type": "string", "enum": ["OFF", "READ_ONLY", "LEARN"], "description": "New mode."}},
+            "required": ["mode"],
+        },
+    },
+    {
+        "name": "get_discovery_status",
+        "description": "Report discovery mode, storage path, learned-website count, and thresholds.",
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+    # ------------------------------------------------------------------ #
+    # OCR
+    # ------------------------------------------------------------------ #
+    {
+        "name": "extract_text_from_screenshot",
+        "description": "Screenshot the page (or an element) and OCR the text out of the pixels. For info inside images/canvas not in the DOM. Requires Tesseract.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "fullPage": {"type": "boolean", "description": "Capture the full scrollable page."},
+                "selector": {"type": "string", "description": "Optional CSS selector to OCR only that element."},
+                "lang": {"type": "string", "description": "Tesseract language code (default eng)."},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "read_image",
+        "description": "OCR a local image file and return its text. Requires Tesseract.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "source": {"type": "string", "description": "Path to an image file on disk."},
+                "lang": {"type": "string", "description": "Tesseract language code (default eng)."},
+            },
+            "required": ["source"],
+        },
+    },
+    # ------------------------------------------------------------------ #
+    # AI judgment (provider-backed): goal check, element finding, planning
+    # ------------------------------------------------------------------ #
+    {
+        "name": "verify_goal",
+        "description": "Look at the current page and judge whether a natural-language GOAL is met. Returns {success, confidence, reason}. Self-correcting automation.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "goal": {"type": "string", "description": "The condition to check, in plain language."},
+                "fullPage": {"type": "boolean", "description": "Verify against a full-page screenshot."},
+            },
+            "required": ["goal"],
+        },
+    },
+    {
+        "name": "find_element",
+        "description": "Find the element best matching a natural-language description (e.g. 'blue login button'). Returns a usable CSS selector + confidence.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "description": {"type": "string", "description": "What the element looks like / does."},
+                "limit": {"type": "integer", "description": "Max interactive candidates to consider (default 60)."},
+            },
+            "required": ["description"],
+        },
+    },
+    {
+        "name": "click_by_description",
+        "description": "Locate an element by natural-language description and CLICK it (find_element + click).",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "description": {"type": "string", "description": "Plain-language description of the element to click."},
+                "limit": {"type": "integer", "description": "Max candidates to consider (default 60)."},
+                "humanize": {"type": "boolean", "description": "Force human-like (true) or instant (false) clicking."},
+            },
+            "required": ["description"],
+        },
+    },
+    {
+        "name": "plan_actions",
+        "description": "Ask for an ordered action PLAN to achieve a goal so you can inspect it before executing. Returns a JSON list of steps.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "goal": {"type": "string", "description": "The high-level objective to plan for."},
+                "includeContext": {"type": "boolean", "description": "Include current page context (default true)."},
+            },
+            "required": ["goal"],
+        },
+    },
+    # ------------------------------------------------------------------ #
+    # Workflows (named, saved sessions)
+    # ------------------------------------------------------------------ #
+    {
+        "name": "save_workflow",
+        "description": "Save the current recorded session as a named, re-runnable workflow (record once, run later with no AI).",
+        "parameters": {
+            "type": "object",
+            "properties": {"name": {"type": "string", "description": "A name for the workflow."}},
+            "required": ["name"],
+        },
+    },
+    {
+        "name": "run_workflow",
+        "description": "Replay a previously saved workflow by name.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "The workflow to run."},
+                "delayMs": {"type": "integer", "description": "Pause between steps (default 500)."},
+                "continueOnError": {"type": "boolean", "description": "Keep going after a failed step (default true)."},
+            },
+            "required": ["name"],
+        },
+    },
+    {
+        "name": "list_workflows",
+        "description": "List saved workflows by name.",
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+    # ------------------------------------------------------------------ #
+    # Browser sessions (pool of isolated browsers; one active at a time)
+    # ------------------------------------------------------------------ #
+    {
+        "name": "create_session",
+        "description": "Create a new, isolated browser session (own cookies/tabs/state) and make it active. Other tools act on the active session.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "sessionId": {"type": "string", "description": "Optional id; omit to auto-generate."},
+                "makeActive": {"type": "boolean", "description": "Make it active immediately (default true)."},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "list_sessions",
+        "description": "List all browser sessions (id, active flag, running, url, tab count).",
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "switch_session",
+        "description": "Make a different browser session the active one.",
+        "parameters": {
+            "type": "object",
+            "properties": {"sessionId": {"type": "string", "description": "The session id to activate."}},
+            "required": ["sessionId"],
+        },
+    },
+    {
+        "name": "close_session",
+        "description": "Close a browser session (or the active one when omitted).",
+        "parameters": {
+            "type": "object",
+            "properties": {"sessionId": {"type": "string", "description": "The session to close; omit for active."}},
+            "required": [],
+        },
+    },
 ]
 
 
@@ -486,6 +967,10 @@ async def dispatchTool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         return await manager.setHeadless(arguments.get("headless", True))
     if name == "clear_profile":
         return await manager.clearProfile()
+    if name == "set_stealth":
+        return await manager.setStealth(arguments["enabled"])
+    if name == "set_humanize":
+        return await manager.setHumanize(arguments["enabled"])
     if name == "navigate":
         return await manager.navigate(
             url=arguments["url"],
@@ -584,6 +1069,121 @@ async def dispatchTool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         return await manager.clearNetwork()
     if name == "clear_storage":
         return await manager.clearStorage(arguments.get("kinds"))
+    if name == "get_tabs":
+        return await manager.getTabs()
+    if name == "get_accessibility_tree":
+        return await manager.getAccessibilityTree(
+            arguments.get("interestingOnly", True), arguments.get("root")
+        )
+    if name == "audit_page":
+        return await manager.auditPage(arguments.get("sampleLimit", 400))
+    if name == "compare_screenshots":
+        return await manager.compareScreenshots(
+            arguments["before"],
+            arguments["after"],
+            pixelThreshold=arguments.get("pixelThreshold", 60),
+            saveDiff=arguments.get("saveDiff", False),
+        )
+    if name == "create_snapshot":
+        return await manager.createSnapshot(savePath=arguments.get("savePath"))
+    if name == "restore_snapshot":
+        return await manager.restoreSnapshot(
+            path=arguments.get("path"),
+            snapshot=arguments.get("snapshot"),
+            navigate=arguments.get("navigate", True),
+        )
+    if name == "start_session":
+        return await manager.startSession(arguments.get("name"))
+    if name == "stop_session":
+        return await manager.stopSession()
+    if name == "get_session":
+        return await manager.getSession()
+    if name == "save_session":
+        return await manager.saveSession(arguments.get("path"))
+    if name == "load_session":
+        return await manager.loadSession(arguments["path"])
+    if name == "replay_session":
+        return await manager.replaySession(
+            path=arguments.get("path"),
+            delayMs=arguments.get("delayMs", 500),
+            continueOnError=arguments.get("continueOnError", True),
+        )
+    if name == "remember_page":
+        return await manager.rememberPage(
+            tags=arguments.get("tags"), withScreenshot=arguments.get("withScreenshot", True)
+        )
+    if name == "search_memory":
+        return await manager.searchMemory(arguments["query"], limit=arguments.get("limit", 10))
+    if name == "list_memory":
+        return await manager.listMemory(limit=arguments.get("limit", 50))
+    if name == "clear_memory":
+        return await manager.clearMemory()
+    if name == "discover_page":
+        return await manager.discoverPage(arguments.get("url"))
+    if name == "discover_website":
+        return await manager.discoverWebsite(
+            startUrl=arguments.get("startUrl"), maxPages=arguments.get("maxPages", 10)
+        )
+    if name == "update_skill":
+        return await manager.updateSkill(
+            arguments["url"], success=arguments.get("success"),
+            confidenceDelta=arguments.get("confidenceDelta"),
+        )
+    if name == "list_skills":
+        return await manager.listSkills(arguments.get("domain"))
+    if name == "search_skills":
+        return await manager.searchSkills(arguments["query"], limit=arguments.get("limit", 20))
+    if name == "export_skills":
+        return await manager.exportSkills(arguments.get("domain"), savePath=arguments.get("savePath"))
+    if name == "import_skills":
+        return await manager.importSkills(
+            bundle=arguments.get("bundle"), path=arguments.get("path"),
+            overwrite=arguments.get("overwrite", False),
+        )
+    if name == "clear_skills":
+        return await manager.clearSkills(arguments.get("domain"))
+    if name == "set_discovery_mode":
+        return await manager.setDiscoveryMode(arguments["mode"])
+    if name == "get_discovery_status":
+        return await manager.getDiscoveryStatus()
+    if name == "extract_text_from_screenshot":
+        return await manager.extractTextFromScreenshot(
+            fullPage=arguments.get("fullPage", False),
+            selector=arguments.get("selector"),
+            lang=arguments.get("lang", "eng"),
+        )
+    if name == "read_image":
+        return await manager.readImage(arguments["source"], lang=arguments.get("lang", "eng"))
+    if name == "verify_goal":
+        return await manager.verifyGoal(arguments["goal"], fullPage=arguments.get("fullPage", False))
+    if name == "find_element":
+        return await manager.findElement(arguments["description"], limit=arguments.get("limit", 60))
+    if name == "click_by_description":
+        return await manager.clickByDescription(
+            arguments["description"], limit=arguments.get("limit", 60),
+            humanize=arguments.get("humanize"),
+        )
+    if name == "plan_actions":
+        return await manager.planActions(
+            arguments["goal"], includeContext=arguments.get("includeContext", True)
+        )
+    if name == "save_workflow":
+        return await manager.saveWorkflow(arguments["name"])
+    if name == "run_workflow":
+        return await manager.runWorkflow(
+            arguments["name"], delayMs=arguments.get("delayMs", 500),
+            continueOnError=arguments.get("continueOnError", True),
+        )
+    if name == "list_workflows":
+        return await manager.listWorkflows()
+    if name == "create_session":
+        return createSession(arguments.get("sessionId"), makeActive=arguments.get("makeActive", True))
+    if name == "list_sessions":
+        return listSessions()
+    if name == "switch_session":
+        return switchSession(arguments["sessionId"])
+    if name == "close_session":
+        return await closeSession(arguments.get("sessionId"))
 
     logger.warning("Unknown tool requested: %s", name)
     return {
@@ -666,6 +1266,10 @@ class ClaudeAdapter:
                 "calling runConversation()."
             )
 
+        # Judgment tools (verify_goal / find_element / plan_actions) this run
+        # invokes should reason with Claude too — match the driver.
+        intelligence.setAiProvider("claude")
+
         # Reads ANTHROPIC_API_KEY from the environment.
         client = anthropic.Anthropic()
 
@@ -681,6 +1285,7 @@ class ClaudeAdapter:
                 model=self.model,
                 max_tokens=16000,
                 thinking={"type": "adaptive"},
+                system=SYSTEM_PROMPT,
                 tools=tools,
                 messages=messages,
             )

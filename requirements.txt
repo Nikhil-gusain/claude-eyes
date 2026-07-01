@@ -32,9 +32,27 @@ pillow>=10.2             # image loading, annotation, resizing
 numpy>=1.26              # array math backing the vision pipeline
 
 # ----- ai -----
+# Provider SDKs are OPTIONAL at runtime: each adapter imports its SDK lazily and
+# raises a clear error only if you actually run that provider without it.
 mcp>=1.2                 # Model Context Protocol stdio server (FastMCP)
 anthropic>=0.45          # Claude adapter (default model: claude-opus-4-8)
-openai>=1.30             # OpenAI adapter
+openai>=1.30             # OpenAI adapter (default model: gpt-4o)
+google-genai>=1.0        # Gemini adapter (default model: gemini-2.5-flash)
+
+# ----- no-image mode -----
+# Microsoft's MarkItDown converts images/PDF/Office/HTML to markdown so an agent
+# can read media as text (the `to_markdown` tool + global no-image mode). Optional
+# at runtime: the media helpers degrade gracefully if it is not installed.
+# The [pdf,docx,pptx,xlsx] extras pull the per-format backends — without them
+# base MarkItDown only handles HTML/text/CSV/JSON (PDF would raise
+# MissingDependency). `set_no_image_mode`/`to_markdown` report which formats work.
+markitdown[pdf,docx,pptx,xlsx]>=0.0.1  # image/PDF/Office -> markdown (no-image mode)
+
+# ----- OCR (read text baked into images/screenshots) -----
+# Optional at runtime: `extract_text_from_screenshot` / `read_image` degrade to a
+# clear error if missing. Needs BOTH this package AND the system Tesseract binary
+# (e.g. `brew install tesseract` / `apt-get install tesseract-ocr`).
+pytesseract>=0.3.10  # optional OCR engine wrapper
 
 # ----- test -----
 pytest>=8.0              # test runner

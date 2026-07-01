@@ -22,6 +22,12 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP, Image
 
 from app.browser.browser_manager import getBrowserManager
+from app.browser.session_pool import (
+    closeSession,
+    createSession,
+    listSessions,
+    switchSession,
+)
 from app.utils.config import settings
 from app.utils.error_handler import safeAsync
 from app.utils.logger import getLogger
@@ -37,34 +43,42 @@ mcp = FastMCP("ai-browser-controller")
 @mcp.tool(name="open_browser")
 @safeAsync(action="open_browser")
 async def openBrowser(
+    profile: str | None = None,
     headless: bool | None = None,
     browserType: str = "chromium",
     viewportWidth: int | None = None,
     viewportHeight: int | None = None,
     userAgent: str | None = None,
 ) -> dict[str, Any]:
-    """Launch a PERSISTENT browser profile — you choose headless or headed.
+    """Launch a PERSISTENT browser profile — headless by default, headed on demand.
 
-    The session reuses an on-disk profile, so cookies, tokens and logins (Gmail,
-    etc.) PERSIST across runs: if the user logged in before, they're still logged
-    in now.
+    PROFILE SELECTION (important): a profile is one Chrome "user" with its own
+    logins/cookies. If you do NOT pass ``profile`` and no profile is active yet,
+    this returns ``status: "profile_selection_required"`` with the list of
+    available profiles instead of launching. When that happens you MUST ask the
+    user which profile to use (or to pick one at random):
+    - If you have a way to ask the user (e.g. an AskUserQuestion tool), use it.
+    - Otherwise, present the returned profile names plus "random" / "create a new
+      one" to the user and STOP, waiting for their reply.
+    Then call ``open_browser`` again with ``profile=<name>`` or ``profile="random"``
+    (or call ``select_profile`` first). The chosen profile is remembered on disk,
+    so later chats reuse the SAME profile automatically without re-asking.
 
-    Choose the mode:
-    - ``headless=True`` (default): no visible window — fast, for autonomous work.
-    - ``headless=False``: a real visible window. Use this when a HUMAN must act
-      manually — solving a captcha / "are you human" check, or a first-time login
-      the AI shouldn't do. You can also flip a running browser with
-      ``set_headless`` without losing state.
+    Logins (Gmail, etc.) PERSIST across runs within a profile. Use
+    ``login_session`` for first-time manual logins/sign-ups.
 
     Args:
-        headless: ``False`` to show a real window for manual/human interaction,
-            ``True`` for no window. Omit to use the server's configured default
-            (the ``ABC_HEADLESS`` setting).
+        profile: Profile name to use, or ``"random"`` to pick one. Omit to use the
+            remembered active profile (or trigger selection if none is set yet).
+        headless: ``False`` for a visible window (human/manual steps), ``True`` for
+            none. Omit for the server default (``ABC_HEADLESS``).
         browserType: ``chromium`` (default), ``firefox``, or ``webkit``.
         viewportWidth / viewportHeight: optional window size in pixels.
         userAgent: optional custom User-Agent string.
     """
     kwargs: dict[str, Any] = {"browserType": browserType}
+    if profile is not None:
+        kwargs["profile"] = profile
     if headless is not None:
         kwargs["headless"] = headless
     if viewportWidth:
@@ -74,6 +88,95 @@ async def openBrowser(
     if userAgent:
         kwargs["userAgent"] = userAgent
     return await getBrowserManager().openBrowser(**kwargs)
+
+
+# --------------------------------------------------------------------- #
+# Profiles (multi-account; the active one persists across chats)
+# --------------------------------------------------------------------- #
+@mcp.tool(name="list_profiles")
+@safeAsync(action="list_profiles")
+async def listProfiles() -> dict[str, Any]:
+    """List the available browser profiles and which one is currently active.
+
+    Lists the managed Chrome user-data profiles. Use this to show the user their
+    choices before opening a browser. Each profile is an isolated "user" with its
+    own logins/cookies.
+    """
+    return await getBrowserManager().listProfiles()
+
+
+@mcp.tool(name="select_profile")
+@safeAsync(action="select_profile")
+async def selectProfile(name: str) -> dict[str, Any]:
+    """Set the active browser profile (remembered across chats).
+
+    Activates a managed user-data profile.
+
+    Args:
+        name: The profile to activate, or ``"random"`` to pick an existing one.
+            Creates the profile if it does not exist yet. After this,
+            ``open_browser``/``navigate`` use this profile until changed.
+    """
+    return await getBrowserManager().selectProfile(name)
+
+
+@mcp.tool(name="create_profile")
+@safeAsync(action="create_profile")
+async def createProfile(name: str, makeActive: bool = True) -> dict[str, Any]:
+    """Create a new, empty browser profile (a fresh "user").
+
+    Creates a managed user-data directory.
+
+    Args:
+        name: Name for the new profile (slugified to letters/digits/_/-).
+        makeActive: When ``True`` (default), also make it the active profile.
+    """
+    return await getBrowserManager().createProfile(name, makeActive=makeActive)
+
+
+@mcp.tool(name="login_session")
+@safeAsync(action="login_session")
+async def loginSession(profile: str | None = None, url: str | None = None) -> dict[str, Any]:
+    """Open a profile in a headed window so the USER can log in / sign up.
+
+    Use this for sites that need a real human to authenticate (Google account,
+    creating a new account, solving a captcha) before the agent can automate
+    them. A headed window opens on the profile; the user logs in; the session is
+    saved into the persistent profile for all future automated runs.
+
+    Args:
+        profile: Profile to log into (or ``"random"``). If omitted and none is
+            active, returns ``profile_selection_required`` — ask the user first.
+        url: Optional URL to open for the login (e.g. the site's sign-in page).
+    """
+    return await getBrowserManager().loginSession(profile=profile, url=url)
+
+
+@mcp.tool(name="set_stealth")
+@safeAsync(action="set_stealth")
+async def setStealth(enabled: bool) -> dict[str, Any]:
+    """Toggle STEALTH (anti-bot fingerprinting hardening).
+
+    Updates the stealth default applied on the next browser launch.
+
+    Args:
+        enabled: ``True`` to enable stealth, ``False`` to disable it.
+    """
+    return await getBrowserManager().setStealth(enabled)
+
+
+@mcp.tool(name="set_humanize")
+@safeAsync(action="set_humanize")
+async def setHumanize(enabled: bool) -> dict[str, Any]:
+    """Toggle HUMANIZED input (human-like cursor/typing/scrolling) as the default.
+
+    Sets whether click/fill/scroll behave human-like by default (each of those
+    tools can still override per-call via their ``humanize`` argument).
+
+    Args:
+        enabled: ``True`` for human-like input by default, ``False`` for instant.
+    """
+    return await getBrowserManager().setHumanize(enabled)
 
 
 @mcp.tool(name="set_headless")
@@ -324,16 +427,23 @@ async def scroll(
     selector: str | None = None,
     toTop: bool = False,
     toBottom: bool = False,
+    humanize: bool | None = None,
 ) -> dict[str, Any]:
-    """Scroll the page or a scrollable element.
+    """Scroll the page or a scrollable element (human-like by default).
+
+    By default scrolling is lazy and incremental — small wheel flicks with
+    pauses, like a human discovering the page — rather than an instant jump, so
+    it looks natural to bot-detection.
 
     Args:
         deltaY: Vertical scroll amount in pixels (positive scrolls down).
         deltaX: Horizontal scroll amount in pixels (positive scrolls right).
-        selector: Optional CSS selector of the element to scroll; defaults to the
-            page/window.
-        toTop: When ``True``, jump to the top, ignoring the deltas.
-        toBottom: When ``True``, jump to the bottom, ignoring the deltas.
+        selector: Optional CSS selector to scroll into view (lazily); defaults to
+            the page/window.
+        toTop: When ``True``, scroll to the top, ignoring the deltas.
+        toBottom: When ``True``, scroll to the bottom, ignoring the deltas.
+        humanize: Force human-like (``True``) or instant (``False``) scrolling;
+            ``None`` uses the server default (``ABC_HUMANIZE``).
     """
     return await getBrowserManager().scroll(
         deltaX=deltaX,
@@ -341,6 +451,7 @@ async def scroll(
         selector=selector,
         toTop=toTop,
         toBottom=toBottom,
+        humanize=humanize,
     )
 
 
@@ -364,8 +475,13 @@ async def click(
     button: str = "left",
     clickCount: int = 1,
     timeoutMs: int | None = None,
+    humanize: bool | None = None,
 ) -> dict[str, Any]:
-    """Click the element matched by ``selector``.
+    """Click the element matched by ``selector`` (human-like cursor by default).
+
+    By default the cursor travels a curved, slightly wobbling path from where it
+    last was to a random point inside the target, pauses, then presses — never a
+    straight teleport to the exact center — so cursor-movement bot checks pass.
 
     Args:
         selector: CSS selector of the element to click.
@@ -373,36 +489,46 @@ async def click(
         clickCount: Number of clicks to deliver (e.g. ``2`` for a double click).
         timeoutMs: Optional wait timeout in milliseconds; ``None`` uses the
             server default.
+        humanize: Force human-like (``True``) or instant (``False``) clicking;
+            ``None`` uses the server default (``ABC_HUMANIZE``).
     """
     return await getBrowserManager().click(
-        selector, button=button, clickCount=clickCount, timeoutMs=timeoutMs
+        selector, button=button, clickCount=clickCount, timeoutMs=timeoutMs, humanize=humanize
     )
 
 
 @mcp.tool(name="double_click")
 @safeAsync(action="double_click")
-async def doubleClick(selector: str, timeoutMs: int | None = None) -> dict[str, Any]:
-    """Double-click the element matched by ``selector``.
+async def doubleClick(
+    selector: str, timeoutMs: int | None = None, humanize: bool | None = None
+) -> dict[str, Any]:
+    """Double-click the element matched by ``selector`` (human-like by default).
 
     Args:
         selector: CSS selector of the element to double-click.
         timeoutMs: Optional wait timeout in milliseconds; ``None`` uses the
             server default.
+        humanize: Force human-like (``True``) or instant (``False``) clicking;
+            ``None`` uses the server default (``ABC_HUMANIZE``).
     """
-    return await getBrowserManager().doubleClick(selector, timeoutMs=timeoutMs)
+    return await getBrowserManager().doubleClick(selector, timeoutMs=timeoutMs, humanize=humanize)
 
 
 @mcp.tool(name="right_click")
 @safeAsync(action="right_click")
-async def rightClick(selector: str, timeoutMs: int | None = None) -> dict[str, Any]:
+async def rightClick(
+    selector: str, timeoutMs: int | None = None, humanize: bool | None = None
+) -> dict[str, Any]:
     """Right-click (context-menu click) the element matched by ``selector``.
 
     Args:
         selector: CSS selector of the element to right-click.
         timeoutMs: Optional wait timeout in milliseconds; ``None`` uses the
             server default.
+        humanize: Force human-like (``True``) or instant (``False``) clicking;
+            ``None`` uses the server default (``ABC_HUMANIZE``).
     """
-    return await getBrowserManager().rightClick(selector, timeoutMs=timeoutMs)
+    return await getBrowserManager().rightClick(selector, timeoutMs=timeoutMs, humanize=humanize)
 
 
 @mcp.tool(name="fill")
@@ -412,8 +538,14 @@ async def fill(
     value: str,
     clearFirst: bool = True,
     timeoutMs: int | None = None,
+    humanize: bool | None = None,
 ) -> dict[str, Any]:
     """Type ``value`` into the input/textarea matched by ``selector``.
+
+    By default typing is HUMAN-PACED (~90 WPM with natural jitter and the odd
+    pause; tune with ABC_TYPING_WPM) and the field is reached by moving the
+    cursor there and clicking to
+    focus — so it does not look like a machine pasted the whole string at once.
 
     Args:
         selector: CSS selector of the input element.
@@ -421,9 +553,11 @@ async def fill(
         clearFirst: When ``True``, clear any existing content before typing.
         timeoutMs: Optional wait timeout in milliseconds; ``None`` uses the
             server default.
+        humanize: Force human-paced (``True``) or instant (``False``) typing;
+            ``None`` uses the server default (``ABC_HUMANIZE``).
     """
     return await getBrowserManager().fill(
-        selector, value, clearFirst=clearFirst, timeoutMs=timeoutMs
+        selector, value, clearFirst=clearFirst, timeoutMs=timeoutMs, humanize=humanize
     )
 
 
@@ -445,17 +579,28 @@ async def downloadFile(
     selector: str,
     saveDir: str | None = None,
     timeoutMs: int | None = None,
+    imagesOnly: bool = True,
 ) -> dict[str, Any]:
-    """Click ``selector`` to trigger a download and save the resulting file.
+    """Click ``selector`` to trigger a download and save the resulting file SAFELY.
+
+    By default only REAL images are kept: the saved file's actual bytes are
+    inspected (magic number + full decode) and anything that is really an
+    executable/app/archive disguised as an image — or any non-image — is deleted
+    and reported as an error. This blocks "download this image" malware lures.
+    Downloads may take a long time, so the wait ceiling is generous (up to ~1h,
+    ``ABC_MAX_DOWNLOAD_WAIT_MS``).
 
     Args:
         selector: CSS selector of the element that initiates the download.
         saveDir: Optional directory to save into; ``None`` uses the server's
             default download directory.
-        timeoutMs: Optional wait timeout in milliseconds; ``None`` uses the
-            server default.
+        timeoutMs: Optional wait ceiling in ms; ``None`` uses the long download max.
+        imagesOnly: Keep only verified images (default ``True``). Set ``False`` to
+            allow any file (use only when you trust the source).
     """
-    return await getBrowserManager().downloadFile(selector, saveDir=saveDir, timeoutMs=timeoutMs)
+    return await getBrowserManager().downloadFile(
+        selector, saveDir=saveDir, timeoutMs=timeoutMs, imagesOnly=imagesOnly
+    )
 
 
 @mcp.tool(name="press_keys")
@@ -506,6 +651,91 @@ async def waitForNetworkIdle(timeoutMs: int | None = None) -> dict[str, Any]:
     return await getBrowserManager().waitForNetworkIdle(timeoutMs=timeoutMs)
 
 
+@mcp.tool(name="wait_for_stable")
+@safeAsync(action="wait_for_stable")
+async def waitForStable(
+    selector: str,
+    stableMs: int = 1200,
+    timeoutMs: int | None = None,
+) -> dict[str, Any]:
+    """Wait QUIETLY until an element's text stops changing, then return its text.
+
+    This is the right way to wait for a slow online AI (ChatGPT, etc.): the
+    answer streams in token by token, then stops. Point ``selector`` at the
+    response container and this resolves once the text has been unchanged for
+    ``stableMs`` — no polling loops, no fixed sleeps. Capped at 5 minutes by
+    default (``ABC_MAX_WAIT_MS``).
+
+    Args:
+        selector: CSS selector of the element whose text settles (the AI answer).
+        stableMs: How long the text must stay unchanged to count as done.
+        timeoutMs: Hard cap in ms; ``None`` uses the server max-wait (5 min).
+    """
+    return await getBrowserManager().waitForStable(selector, stableMs=stableMs, timeoutMs=timeoutMs)
+
+
+@mcp.tool(name="wait_for_response")
+@safeAsync(action="wait_for_response")
+async def waitForResponse(
+    urlPattern: str, timeoutMs: int | None = None, includeQuery: bool = False
+) -> dict[str, Any]:
+    """Wait until a network response matching ``urlPattern`` FINISHES.
+
+    Reads straight from the network layer: resolves the moment the matching
+    (possibly streamed/SSE) response closes — e.g. when an online AI's backend
+    has finished sending its answer. Often more reliable than watching the DOM.
+    Capped at 5 minutes by default (``ABC_MAX_WAIT_MS``).
+
+    MATCHING: ``urlPattern`` is matched (regex first, else substring) against the
+    URL's scheme+host+**path** — the query string is EXCLUDED by default, so a
+    loose pattern won't accidentally latch onto a query parameter of an unrelated
+    request (e.g. a bot-detection beacon like ``/anomaly.js?cc=duckchat``). Prefer
+    a path-anchored pattern such as ``"/backend-api/conversation"``. The returned
+    ``url`` shows exactly what matched — check it. Set ``includeQuery=True`` only
+    if the discriminating part really lives in the query string.
+
+    Args:
+        urlPattern: Regex or substring matched against the response URL's path.
+        timeoutMs: Hard cap in ms; ``None`` uses the server max-wait (5 min).
+        includeQuery: Match against the full URL (including query) instead of path.
+    """
+    return await getBrowserManager().waitForResponse(
+        urlPattern, timeoutMs=timeoutMs, includeQuery=includeQuery
+    )
+
+
+# --------------------------------------------------------------------- #
+# No-image mode (MarkItDown) — read text instead of pixels
+# --------------------------------------------------------------------- #
+@mcp.tool(name="to_markdown")
+@safeAsync(action="to_markdown")
+async def toMarkdown(source: str) -> dict[str, Any]:
+    """Convert an image / PDF / Office doc / HTML page (file path or URL) to markdown.
+
+    Backed by Microsoft's MarkItDown. Use it to read media as text — e.g. extract
+    a PDF's contents, or describe a downloaded chart — without handling pixels.
+
+    Args:
+        source: A local file path or a URL to convert.
+    """
+    return await getBrowserManager().toMarkdown(source)
+
+
+@mcp.tool(name="set_no_image_mode")
+@safeAsync(action="set_no_image_mode")
+async def setNoImageMode(enabled: bool) -> dict[str, Any]:
+    """Toggle global no-image mode.
+
+    When ON, pixel screenshots are suppressed and you are steered to text:
+    ``read_page`` for page text and ``to_markdown`` to convert media. Turn it OFF
+    to allow screenshots again.
+
+    Args:
+        enabled: ``True`` to enable no-image mode, ``False`` to disable.
+    """
+    return await getBrowserManager().setNoImageMode(enabled)
+
+
 # --------------------------------------------------------------------- #
 # Visual intelligence
 # --------------------------------------------------------------------- #
@@ -544,6 +774,9 @@ async def screenshot(fullPage: bool = False, selector: str | None = None) -> Ima
     storage. Use ``take_screenshot`` instead only when you explicitly want a saved
     file path.
 
+    When no-image mode is ON, this returns a short text notice (no pixels) instead
+    of an image — use ``read_page`` / ``to_markdown`` to read the page as text.
+
     Args:
         fullPage: When ``True``, capture the entire scrollable page.
         selector: Optional CSS selector to capture only that element.
@@ -551,7 +784,12 @@ async def screenshot(fullPage: bool = False, selector: str | None = None) -> Ima
     result = await getBrowserManager().captureScreenshotData(fullPage=fullPage, selector=selector)
     if not result.get("success"):
         raise RuntimeError(result.get("details") or result.get("error") or "screenshot failed")
-    return Image(data=result["data"]["image"], format="png")
+    data = result.get("data", {})
+    # No-image mode short-circuits to a notice with no "image" key — return that
+    # as text instead of trying to build an (absent) image block.
+    if data.get("noImageMode") or "image" not in data:
+        return data.get("note", "No-image mode is on; screenshots are suppressed.")
+    return Image(data=data["image"], format="png")
 
 
 @mcp.tool(name="clear_storage")
@@ -588,6 +826,547 @@ async def startRecording(fps: int | None = None, sessionName: str | None = None)
 async def stopRecording() -> dict[str, Any]:
     """Stop the active recording and finalise the video file."""
     return await getBrowserManager().stopRecording()
+
+
+# --------------------------------------------------------------------- #
+# Tab intelligence
+# --------------------------------------------------------------------- #
+@mcp.tool(name="get_tabs")
+@safeAsync(action="get_tabs")
+async def getTabs() -> dict[str, Any]:
+    """Summarise every open tab: index, title, URL, host, and which is active.
+
+    Use this when you have several tabs open and need to remember what each one
+    is before switching — large multi-tab sessions are easy to lose track of.
+    """
+    return await getBrowserManager().getTabs()
+
+
+# --------------------------------------------------------------------- #
+# Accessibility & visual QA
+# --------------------------------------------------------------------- #
+@mcp.tool(name="get_accessibility_tree")
+@safeAsync(action="get_accessibility_tree")
+async def getAccessibilityTree(
+    interestingOnly: bool = True, root: str | None = None
+) -> dict[str, Any]:
+    """Return the page's accessibility tree (roles/names, as a screen reader sees it).
+
+    Often a better way to understand page structure than raw HTML: each node has a
+    role (button, link, heading...) and accessible name.
+
+    Args:
+        interestingOnly: Prune presentational/uninteresting nodes (default ``True``).
+        root: Optional CSS selector to scope the snapshot to one element's subtree.
+    """
+    return await getBrowserManager().getAccessibilityTree(interestingOnly, root)
+
+
+@mcp.tool(name="audit_page")
+@safeAsync(action="audit_page")
+async def auditPage(sampleLimit: int = 400) -> dict[str, Any]:
+    """Audit the current page for common UI defects (no screenshot needed).
+
+    Returns counts plus bounded samples of: horizontal ``overflowIssues``,
+    ``hiddenButtons`` (interactive elements that aren't visible), ``brokenImages``,
+    and ``contrastProblems`` (approximate WCAG text/background contrast). Useful
+    for a coding agent checking the UI it just built.
+
+    Args:
+        sampleLimit: Max number of text elements the contrast pass inspects.
+    """
+    return await getBrowserManager().auditPage(sampleLimit)
+
+
+@mcp.tool(name="compare_screenshots")
+@safeAsync(action="compare_screenshots")
+async def compareScreenshots(
+    before: str, after: str, pixelThreshold: int = 60, saveDiff: bool = False
+) -> dict[str, Any]:
+    """Compare two screenshot files and quantify what visually changed.
+
+    Returns ``visualDifferencePercent`` (share of changed pixels) and
+    ``changedRegions`` (coarse grid cells that changed, with bounding boxes).
+    Capture two ``take_screenshot`` files (e.g. before/after an action) and pass
+    their paths here to detect and locate visual changes.
+
+    Args:
+        before: Path to the baseline screenshot PNG/JPEG.
+        after: Path to the screenshot to compare against the baseline.
+        pixelThreshold: Per-pixel change sensitivity (0-765 summed channel delta).
+        saveDiff: When ``True``, also write a change-mask PNG and return its path.
+    """
+    return await getBrowserManager().compareScreenshots(
+        before, after, pixelThreshold=pixelThreshold, saveDiff=saveDiff
+    )
+
+
+# --------------------------------------------------------------------- #
+# Browser-state snapshot (cookies + storage + open tabs)
+# --------------------------------------------------------------------- #
+@mcp.tool(name="create_snapshot")
+@safeAsync(action="create_snapshot")
+async def createSnapshot(savePath: str | None = None) -> dict[str, Any]:
+    """Capture the full browser state to a JSON file: cookies, localStorage,
+    sessionStorage, and the open-tab URLs.
+
+    Restore it later with ``restore_snapshot`` to resume exactly where you left
+    off — a big time saver versus re-logging-in and re-navigating.
+
+    Args:
+        savePath: Optional path for the snapshot JSON; omit to auto-name it under
+            the server's snapshot directory.
+    """
+    return await getBrowserManager().createSnapshot(savePath=savePath)
+
+
+@mcp.tool(name="restore_snapshot")
+@safeAsync(action="restore_snapshot")
+async def restoreSnapshot(path: str, navigate: bool = True) -> dict[str, Any]:
+    """Restore cookies + storage from a snapshot file saved by ``create_snapshot``.
+
+    Because localStorage/sessionStorage are per-origin, the active tab is first
+    navigated to the snapshot's URL, then the stored keys are written back.
+
+    Args:
+        path: Path to a snapshot JSON previously written by ``create_snapshot``.
+        navigate: Re-open the snapshot's URL before restoring storage (default
+            ``True``); set ``False`` to only restore cookies.
+    """
+    return await getBrowserManager().restoreSnapshot(path=path, navigate=navigate)
+
+
+# --------------------------------------------------------------------- #
+# Session replay (structured, replayable action log — not video)
+# --------------------------------------------------------------------- #
+@mcp.tool(name="start_session")
+@safeAsync(action="start_session")
+async def startSession(name: str | None = None) -> dict[str, Any]:
+    """Start recording every replayable action (click/fill/navigate/...) as
+    structured JSON steps.
+
+    Unlike ``start_recording`` (which captures VIDEO), this captures a machine-
+    replayable log you can save, reload and ``replay_session`` later — to
+    reproduce a bug, build a workflow, or audit what was done.
+
+    Args:
+        name: Optional session name; omit to auto-generate a timestamped one.
+    """
+    return await getBrowserManager().startSession(name)
+
+
+@mcp.tool(name="stop_session")
+@safeAsync(action="stop_session")
+async def stopSession() -> dict[str, Any]:
+    """Stop the structured action recording and return the captured steps."""
+    return await getBrowserManager().stopSession()
+
+
+@mcp.tool(name="save_session")
+@safeAsync(action="save_session")
+async def saveSession(path: str | None = None) -> dict[str, Any]:
+    """Save the recorded session to a JSON file for later ``load_session``/replay.
+
+    Args:
+        path: Optional output path; omit to auto-name it under the session directory.
+    """
+    return await getBrowserManager().saveSession(path)
+
+
+@mcp.tool(name="load_session")
+@safeAsync(action="load_session")
+async def loadSession(path: str) -> dict[str, Any]:
+    """Load a previously saved session JSON into memory, ready to ``replay_session``.
+
+    Args:
+        path: Path to a session JSON saved by ``save_session``.
+    """
+    return await getBrowserManager().loadSession(path)
+
+
+@mcp.tool(name="replay_session")
+@safeAsync(action="replay_session")
+async def replaySession(
+    path: str | None = None, delayMs: int = 500, continueOnError: bool = True
+) -> dict[str, Any]:
+    """Replay a recorded session's steps in order against the live browser.
+
+    Loads ``path`` first if given, otherwise replays the in-memory session
+    (from ``start_session``/``load_session``). Returns a per-step success report.
+
+    Args:
+        path: Optional session JSON to load before replaying.
+        delayMs: Pause between steps in milliseconds (default 500).
+        continueOnError: Keep going after a failed step (default ``True``); set
+            ``False`` to stop at the first failure.
+    """
+    return await getBrowserManager().replaySession(
+        path=path, delayMs=delayMs, continueOnError=continueOnError
+    )
+
+
+# --------------------------------------------------------------------- #
+# Browser memory (searchable store of pages the agent has seen)
+# --------------------------------------------------------------------- #
+@mcp.tool(name="remember_page")
+@safeAsync(action="remember_page")
+async def rememberPage(
+    tags: list[str] | None = None, withScreenshot: bool = True
+) -> dict[str, Any]:
+    """Save the CURRENT page into memory so you can recall it later without
+    re-scraping (title, URL, structure, and a screenshot).
+
+    Args:
+        tags: Optional labels to attach (e.g. ``["pricing", "competitor"]``).
+        withScreenshot: Also store a screenshot of the page (default ``True``).
+    """
+    return await getBrowserManager().rememberPage(tags=tags, withScreenshot=withScreenshot)
+
+
+@mcp.tool(name="search_memory")
+@safeAsync(action="search_memory")
+async def searchMemory(query: str, limit: int = 10) -> dict[str, Any]:
+    """Recall remembered pages matching a query (keyword-ranked).
+
+    Avoids re-visiting a page you've already seen — e.g. ``search_memory("pricing
+    page")`` returns the stored record (URL, title, structure, screenshot path).
+
+    Args:
+        query: Words to match against remembered titles/URLs/text/tags.
+        limit: Maximum number of matches to return (default 10).
+    """
+    return await getBrowserManager().searchMemory(query, limit=limit)
+
+
+@mcp.tool(name="list_memory")
+@safeAsync(action="list_memory")
+async def listMemory(limit: int = 50) -> dict[str, Any]:
+    """List the most recently remembered pages."""
+    return await getBrowserManager().listMemory(limit=limit)
+
+
+@mcp.tool(name="clear_memory")
+@safeAsync(action="clear_memory")
+async def clearMemory() -> dict[str, Any]:
+    """Forget all remembered pages (clears the memory store)."""
+    return await getBrowserManager().clearMemory()
+
+
+# --------------------------------------------------------------------- #
+# Website Skill System (persistent per-domain operational knowledge)
+# --------------------------------------------------------------------- #
+@mcp.tool(name="discover_page")
+@safeAsync(action="discover_page")
+async def discoverPage(url: str | None = None) -> dict[str, Any]:
+    """Learn how the CURRENT page works and save a persistent route skill.
+
+    Distils the page into purpose, UI, forms, navigation, and inferred workflows,
+    then merges it into the site's knowledge base (never overwriting prior
+    discoveries). Safe and non-destructive — it never clicks dangerous controls.
+
+    Args:
+        url: Optional URL to navigate to before discovering.
+    """
+    return await getBrowserManager().discoverPage(url)
+
+
+@mcp.tool(name="discover_website")
+@safeAsync(action="discover_website")
+async def discoverWebsite(startUrl: str | None = None, maxPages: int = 10) -> dict[str, Any]:
+    """Crawl internal routes (depth-bounded, safe) and learn a skill for each.
+
+    Args:
+        startUrl: Optional URL to start from (defaults to the current page).
+        maxPages: Max pages to visit (default 10, hard cap 50).
+    """
+    return await getBrowserManager().discoverWebsite(startUrl=startUrl, maxPages=maxPages)
+
+
+@mcp.tool(name="update_skill")
+@safeAsync(action="update_skill")
+async def updateSkill(
+    url: str, success: bool | None = None, confidenceDelta: int | None = None
+) -> dict[str, Any]:
+    """Record an outcome for a route's skill to tune its confidence.
+
+    Args:
+        url: URL of the route whose skill to update.
+        success: ``True`` bumps confidence, ``False`` drops it (triggers rediscovery when low).
+        confidenceDelta: Explicit confidence change (overrides ``success``).
+    """
+    return await getBrowserManager().updateSkill(url, success=success, confidenceDelta=confidenceDelta)
+
+
+@mcp.tool(name="list_skills")
+@safeAsync(action="list_skills")
+async def listSkills(domain: str | None = None) -> dict[str, Any]:
+    """List learned websites, or one domain's routes + workflows (JSON indexes only).
+
+    Args:
+        domain: Optional domain (e.g. ``github.com``) to drill into.
+    """
+    return await getBrowserManager().listSkills(domain)
+
+
+@mcp.tool(name="search_skills")
+@safeAsync(action="search_skills")
+async def searchSkills(query: str, limit: int = 20) -> dict[str, Any]:
+    """Keyword-search learned skills across domains/routes via the JSON indexes.
+
+    Args:
+        query: Words to match against domains/routes/titles.
+        limit: Max results (default 20).
+    """
+    return await getBrowserManager().searchSkills(query, limit=limit)
+
+
+@mcp.tool(name="export_skills")
+@safeAsync(action="export_skills")
+async def exportSkills(domain: str | None = None, savePath: str | None = None) -> dict[str, Any]:
+    """Export learned skills (one domain or all) as a portable bundle.
+
+    Args:
+        domain: Optional single domain to export.
+        savePath: Optional file path to write the bundle to.
+    """
+    return await getBrowserManager().exportSkills(domain, savePath=savePath)
+
+
+@mcp.tool(name="import_skills")
+@safeAsync(action="import_skills")
+async def importSkills(
+    bundle: dict[str, Any] | None = None, path: str | None = None, overwrite: bool = False
+) -> dict[str, Any]:
+    """Import a skills bundle (inline ``bundle`` or from ``path``).
+
+    Args:
+        bundle: Inline bundle produced by ``export_skills``.
+        path: Path to a bundle JSON file.
+        overwrite: Overwrite existing skill files (default ``False``).
+    """
+    return await getBrowserManager().importSkills(bundle=bundle, path=path, overwrite=overwrite)
+
+
+@mcp.tool(name="clear_skills")
+@safeAsync(action="clear_skills")
+async def clearSkills(domain: str | None = None) -> dict[str, Any]:
+    """Forget one domain's skills, or wipe the entire skill store.
+
+    Args:
+        domain: Optional domain to clear; omit to wipe everything.
+    """
+    return await getBrowserManager().clearSkills(domain)
+
+
+@mcp.tool(name="set_discovery_mode")
+@safeAsync(action="set_discovery_mode")
+async def setDiscoveryMode(mode: str) -> dict[str, Any]:
+    """Set the Website Skill System mode: ``OFF``, ``READ_ONLY``, or ``LEARN``.
+
+    Args:
+        mode: ``OFF`` (disabled), ``READ_ONLY`` (read but never modify), or
+            ``LEARN`` (read + discover + update — the default).
+    """
+    return await getBrowserManager().setDiscoveryMode(mode)
+
+
+@mcp.tool(name="get_discovery_status")
+@safeAsync(action="get_discovery_status")
+async def getDiscoveryStatus() -> dict[str, Any]:
+    """Report discovery mode, storage path, learned-website count, and thresholds."""
+    return await getBrowserManager().getDiscoveryStatus()
+
+
+# --------------------------------------------------------------------- #
+# OCR (read text baked into images / screenshots)
+# --------------------------------------------------------------------- #
+@mcp.tool(name="extract_text_from_screenshot")
+@safeAsync(action="extract_text_from_screenshot")
+async def extractTextFromScreenshot(
+    fullPage: bool = False, selector: str | None = None, lang: str = "eng"
+) -> dict[str, Any]:
+    """Screenshot the page (or an element) and OCR the text out of the pixels.
+
+    Use for information that lives inside images/canvas and isn't in the DOM.
+    Requires Tesseract (``pytesseract`` + the ``tesseract`` binary); if missing,
+    a clear error with install hints is returned.
+
+    Args:
+        fullPage: Capture the full scrollable page before OCR.
+        selector: Optional CSS selector to OCR only that element.
+        lang: Tesseract language code (default ``eng``).
+    """
+    return await getBrowserManager().extractTextFromScreenshot(
+        fullPage=fullPage, selector=selector, lang=lang
+    )
+
+
+@mcp.tool(name="read_image")
+@safeAsync(action="read_image")
+async def readImage(source: str, lang: str = "eng") -> dict[str, Any]:
+    """OCR a local image file and return its text.
+
+    Args:
+        source: Path to an image file on disk.
+        lang: Tesseract language code (default ``eng``).
+    """
+    return await getBrowserManager().readImage(source, lang=lang)
+
+
+# --------------------------------------------------------------------- #
+# AI judgment (provider-backed): goal check, element finding, planning
+# --------------------------------------------------------------------- #
+@mcp.tool(name="verify_goal")
+@safeAsync(action="verify_goal")
+async def verifyGoal(goal: str, fullPage: bool = False) -> dict[str, Any]:
+    """Look at the current page and judge whether a natural-language GOAL is met.
+
+    Turns automation into self-correcting automation: e.g.
+    ``verify_goal("the submit button is visible above the fold")`` returns
+    ``{success, confidence, reason}``. Uses the active AI provider (the driving
+    agent's — Gemini/Claude/OpenAI; default Claude); returns a clear unavailable
+    error if that provider's SDK or API key is missing.
+
+    Args:
+        goal: The condition to check, in plain language.
+        fullPage: Verify against a full-page screenshot rather than the viewport.
+    """
+    return await getBrowserManager().verifyGoal(goal, fullPage=fullPage)
+
+
+@mcp.tool(name="find_element")
+@safeAsync(action="find_element")
+async def findElement(description: str, limit: int = 60) -> dict[str, Any]:
+    """Find the element best matching a natural-language description.
+
+    e.g. ``find_element("blue login button")`` returns a usable CSS ``selector``
+    plus confidence/reason — robust to markup you don't know in advance. Uses the
+    active AI provider (Gemini/Claude/OpenAI; default Claude).
+
+    Args:
+        description: What the element looks like / does, in plain language.
+        limit: Max interactive candidates to consider (default 60).
+    """
+    return await getBrowserManager().findElement(description, limit=limit)
+
+
+@mcp.tool(name="click_by_description")
+@safeAsync(action="click_by_description")
+async def clickByDescription(
+    description: str, limit: int = 60, humanize: bool | None = None
+) -> dict[str, Any]:
+    """Locate an element by description and CLICK it (find_element + click).
+
+    e.g. ``click_by_description("the accept cookies button")``. Uses the active
+    AI provider (Gemini/Claude/OpenAI; default Claude).
+
+    Args:
+        description: Plain-language description of the element to click.
+        limit: Max interactive candidates to consider (default 60).
+        humanize: Force human-like (``True``) or instant (``False``) clicking.
+    """
+    return await getBrowserManager().clickByDescription(description, limit=limit, humanize=humanize)
+
+
+@mcp.tool(name="plan_actions")
+@safeAsync(action="plan_actions")
+async def planActions(goal: str, includeContext: bool = True) -> dict[str, Any]:
+    """Ask the AI for an ordered action PLAN to achieve a goal (inspect before run).
+
+    Returns a JSON list of steps (action/target/value/why) so you can review the
+    approach before executing. Uses the active AI provider (Gemini/Claude/OpenAI;
+    default Claude).
+
+    Args:
+        goal: The high-level objective to plan for.
+        includeContext: Include the current page's URL/title/elements as context.
+    """
+    return await getBrowserManager().planActions(goal, includeContext=includeContext)
+
+
+# --------------------------------------------------------------------- #
+# Workflows (named, saved sessions you can re-run by name)
+# --------------------------------------------------------------------- #
+@mcp.tool(name="save_workflow")
+@safeAsync(action="save_workflow")
+async def saveWorkflow(name: str) -> dict[str, Any]:
+    """Save the current recorded session as a named, re-runnable workflow.
+
+    Record a successful sequence with ``start_session``/``stop_session``, then
+    save it here; later ``run_workflow(name)`` repeats it with no AI needed.
+
+    Args:
+        name: A name for the workflow (slugified for the filename).
+    """
+    return await getBrowserManager().saveWorkflow(name)
+
+
+@mcp.tool(name="run_workflow")
+@safeAsync(action="run_workflow")
+async def runWorkflow(name: str, delayMs: int = 500, continueOnError: bool = True) -> dict[str, Any]:
+    """Replay a previously saved workflow by name.
+
+    Args:
+        name: The workflow to run (as saved by ``save_workflow``).
+        delayMs: Pause between steps in milliseconds (default 500).
+        continueOnError: Keep going after a failed step (default ``True``).
+    """
+    return await getBrowserManager().runWorkflow(name, delayMs=delayMs, continueOnError=continueOnError)
+
+
+@mcp.tool(name="list_workflows")
+@safeAsync(action="list_workflows")
+async def listWorkflows() -> dict[str, Any]:
+    """List saved workflows by name."""
+    return await getBrowserManager().listWorkflows()
+
+
+# --------------------------------------------------------------------- #
+# Browser sessions (a pool of isolated browsers; one active at a time)
+# --------------------------------------------------------------------- #
+@mcp.tool(name="create_session")
+@safeAsync(action="create_session")
+async def createSessionTool(sessionId: str | None = None, makeActive: bool = True) -> dict[str, Any]:
+    """Create a new, isolated browser session and (by default) make it active.
+
+    Each session is its own independent browser (own cookies/tabs/state). All
+    other tools act on the ACTIVE session; use ``switch_session`` to move between
+    them — handy for driving several sites/accounts at once.
+
+    Args:
+        sessionId: Optional id for the session; omit to auto-generate one.
+        makeActive: Make the new session active immediately (default ``True``).
+    """
+    return createSession(sessionId, makeActive=makeActive)
+
+
+@mcp.tool(name="list_sessions")
+@safeAsync(action="list_sessions")
+async def listSessionsTool() -> dict[str, Any]:
+    """List all browser sessions (id, active flag, running, url, tab count)."""
+    return listSessions()
+
+
+@mcp.tool(name="switch_session")
+@safeAsync(action="switch_session")
+async def switchSessionTool(sessionId: str) -> dict[str, Any]:
+    """Make a different browser session the active one.
+
+    Args:
+        sessionId: The id of the session to activate.
+    """
+    return switchSession(sessionId)
+
+
+@mcp.tool(name="close_session")
+@safeAsync(action="close_session")
+async def closeSessionTool(sessionId: str | None = None) -> dict[str, Any]:
+    """Close a browser session and free it, or the active one when omitted.
+
+    Args:
+        sessionId: The session to close; omit to close the active session.
+    """
+    return await closeSession(sessionId)
 
 
 # --------------------------------------------------------------------- #

@@ -18,6 +18,7 @@ import os
 from typing import Any
 
 from app.agents.claude_adapter import TOOL_SPECS, dispatchTool
+from app.browser import intelligence
 from app.utils.logger import getLogger
 
 logger = getLogger("agents.openai")
@@ -102,6 +103,10 @@ class OpenAIAdapter:
                 "OPENAI_API_KEY is not set. Export your OpenAI API key before "
                 "calling runConversation()."
             )
+
+        # Judgment tools (verify_goal / find_element / plan_actions) this run
+        # invokes should reason with OpenAI too — match the driver.
+        intelligence.setAiProvider("openai")
 
         # Reads OPENAI_API_KEY from the environment.
         client = openai.OpenAI()

@@ -14,6 +14,8 @@ the file over the same origin. The ``/ws`` WebSocket route is contributed by
 
 from __future__ import annotations
 
+import asyncio
+import json
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
@@ -21,28 +23,72 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from app import __version__
-from app.api.websocket import registerWebSocket
+from app.api.websocket import connectionManager, registerWebSocket
 from app.browser.browser_manager import getBrowserManager
+from app.browser.session_pool import (
+    closeSession,
+    createSession,
+    listSessions,
+    switchSession,
+)
 from app.models.commands import (
+    AccessibilityCommand,
+    AuditCommand,
+    ClickByDescriptionCommand,
     ClickCommand,
+    DiscoverPageCommand,
+    DiscoverWebsiteCommand,
+    DiscoveryModeCommand,
     DownloadCommand,
+    ExportSkillsCommand,
     ExtractCommand,
     FillCommand,
+    FindElementCommand,
     HoverCommand,
+    ImportSkillsCommand,
     LaunchCommand,
+    LoginSessionCommand,
+    MarkdownCommand,
+    MemorySearchCommand,
     NavigateCommand,
+    NoImageModeCommand,
+    OcrScreenshotCommand,
+    PlanActionsCommand,
     PressKeysCommand,
+    ProfileCreateCommand,
+    ProfileSelectCommand,
+    ReadImageCommand,
     RecordingCommand,
+    RememberPageCommand,
+    ReplaySessionCommand,
+    RunWorkflowCommand,
     ScreenshotCommand,
     ScrollCommand,
+<<<<<<< HEAD
     SelectCommand,
+=======
+    SessionCreateCommand,
+    SessionLoadCommand,
+    SessionSaveCommand,
+    SessionStartCommand,
+    SessionSwitchCommand,
+    SkillSearchCommand,
+    SnapshotCreateCommand,
+    SnapshotRestoreCommand,
+>>>>>>> 665617f32f25ac1bd204cbe7f946b09026ed9d28
     TabCommand,
+    UpdateSkillCommand,
     UploadCommand,
+    VerifyGoalCommand,
+    VisualDiffCommand,
     WaitForElementCommand,
+    WaitResponseCommand,
+    WaitStableCommand,
+    WorkflowCommand,
 )
 from app.utils.config import settings
 from app.utils.helpers import ensureDir, errorResponse
@@ -71,10 +117,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         yield
     finally:
         try:
-            await getBrowserManager().closeBrowser()
-            logger.info("Browser closed on shutdown")
+            from app.browser.session_pool import getSessionPool
+
+            closed = await getSessionPool().closeAll()
+            logger.info("Closed %d browser session(s) on shutdown", closed)
         except Exception:  # noqa: BLE001 - shutdown must never raise
-            logger.exception("Failed to close browser on shutdown")
+            logger.exception("Failed to close browser sessions on shutdown")
 
 
 def createApp() -> FastAPI:
@@ -126,6 +174,31 @@ def createApp() -> FastAPI:
         logger.info("Request: status")
         return await getBrowserManager().status()
 
+    @app.get("/events")
+    async def events(request: Request) -> StreamingResponse:
+        """Server-Sent Events stream of browser/progress events.
+
+        A lightweight, one-way push channel: HTTP clients can subscribe here to
+        be notified when long waits finish or progress is published, instead of
+        polling. Heartbeats keep the connection alive through proxies.
+        """
+
+        async def eventStream() -> AsyncIterator[str]:
+            queue = connectionManager.subscribe()
+            try:
+                while True:
+                    if await request.is_disconnected():
+                        break
+                    try:
+                        payload = await asyncio.wait_for(queue.get(), timeout=15.0)
+                        yield f"data: {json.dumps(payload)}\n\n"
+                    except asyncio.TimeoutError:
+                        yield ": keep-alive\n\n"  # comment line = SSE heartbeat
+            finally:
+                connectionManager.unsubscribe(queue)
+
+        return StreamingResponse(eventStream(), media_type="text/event-stream")
+
     # ----------------------------------------------------------------- #
     # Browser lifecycle
     # ----------------------------------------------------------------- #
@@ -138,12 +211,37 @@ def createApp() -> FastAPI:
             viewportWidth=command.viewportWidth,
             viewportHeight=command.viewportHeight,
             userAgent=command.userAgent,
+            profile=command.profile,
+            channel=command.channel,
         )
 
     @app.post("/browser/close")
     async def closeBrowser() -> dict:
         logger.info("Request: close_browser")
         return await getBrowserManager().closeBrowser()
+
+    # ----------------------------------------------------------------- #
+    # Profiles (multi-account)
+    # ----------------------------------------------------------------- #
+    @app.get("/profiles")
+    async def listProfiles() -> dict:
+        logger.info("Request: list_profiles")
+        return await getBrowserManager().listProfiles()
+
+    @app.post("/profiles/select")
+    async def selectProfile(command: ProfileSelectCommand) -> dict:
+        logger.info("Request: select_profile -> %s", command.name)
+        return await getBrowserManager().selectProfile(command.name)
+
+    @app.post("/profiles/create")
+    async def createProfile(command: ProfileCreateCommand) -> dict:
+        logger.info("Request: create_profile -> %s", command.name)
+        return await getBrowserManager().createProfile(command.name, makeActive=command.makeActive)
+
+    @app.post("/browser/login-session")
+    async def loginSession(command: LoginSessionCommand) -> dict:
+        logger.info("Request: login_session")
+        return await getBrowserManager().loginSession(profile=command.profile, url=command.url)
 
     @app.post("/browser/set-headless")
     async def setHeadless(headless: bool = False) -> dict:
@@ -247,6 +345,7 @@ def createApp() -> FastAPI:
             button=command.button,
             clickCount=command.clickCount,
             timeoutMs=command.timeoutMs,
+            humanize=command.humanize,
         )
 
     @app.post("/interact/double-click")
@@ -278,6 +377,7 @@ def createApp() -> FastAPI:
             command.value,
             clearFirst=command.clearFirst,
             timeoutMs=command.timeoutMs,
+            humanize=command.humanize,
         )
 
     @app.post("/interact/scroll")
@@ -289,6 +389,7 @@ def createApp() -> FastAPI:
             selector=command.selector,
             toTop=command.toTop,
             toBottom=command.toBottom,
+            humanize=command.humanize,
         )
 
     @app.post("/interact/press-keys")
@@ -315,6 +416,7 @@ def createApp() -> FastAPI:
             command.selector,
             saveDir=command.saveDir,
             timeoutMs=command.timeoutMs,
+            imagesOnly=command.imagesOnly,
         )
 
     # ----------------------------------------------------------------- #
@@ -333,6 +435,33 @@ def createApp() -> FastAPI:
     async def waitForNetworkIdle() -> dict:
         logger.info("Request: wait_for_network_idle")
         return await getBrowserManager().waitForNetworkIdle()
+
+    @app.post("/wait/stable")
+    async def waitForStable(command: WaitStableCommand) -> dict:
+        logger.info("Request: wait_for_stable -> %s", command.selector)
+        return await getBrowserManager().waitForStable(
+            command.selector, stableMs=command.stableMs, timeoutMs=command.timeoutMs
+        )
+
+    @app.post("/wait/response")
+    async def waitForResponse(command: WaitResponseCommand) -> dict:
+        logger.info("Request: wait_for_response -> %s", command.urlPattern)
+        return await getBrowserManager().waitForResponse(
+            command.urlPattern, timeoutMs=command.timeoutMs, includeQuery=command.includeQuery
+        )
+
+    # ----------------------------------------------------------------- #
+    # No-image mode (MarkItDown)
+    # ----------------------------------------------------------------- #
+    @app.post("/markdown")
+    async def toMarkdown(command: MarkdownCommand) -> dict:
+        logger.info("Request: to_markdown -> %s", command.source)
+        return await getBrowserManager().toMarkdown(command.source)
+
+    @app.post("/no-image-mode")
+    async def setNoImageMode(command: NoImageModeCommand) -> dict:
+        logger.info("Request: set_no_image_mode -> %s", command.enabled)
+        return await getBrowserManager().setNoImageMode(command.enabled)
 
     # ----------------------------------------------------------------- #
     # Visual intelligence
@@ -389,6 +518,259 @@ def createApp() -> FastAPI:
         return await getBrowserManager().clearStorage(kinds)
 
     # ----------------------------------------------------------------- #
+    # Tab intelligence
+    # ----------------------------------------------------------------- #
+    @app.get("/tabs")
+    async def getTabs() -> dict:
+        logger.info("Request: get_tabs")
+        return await getBrowserManager().getTabs()
+
+    # ----------------------------------------------------------------- #
+    # Accessibility & visual QA
+    # ----------------------------------------------------------------- #
+    @app.post("/accessibility")
+    async def getAccessibilityTree(command: AccessibilityCommand) -> dict:
+        logger.info("Request: get_accessibility_tree")
+        return await getBrowserManager().getAccessibilityTree(
+            command.interestingOnly, command.root
+        )
+
+    @app.post("/audit")
+    async def auditPage(command: AuditCommand) -> dict:
+        logger.info("Request: audit_page")
+        return await getBrowserManager().auditPage(command.sampleLimit)
+
+    @app.post("/visual-diff")
+    async def compareScreenshots(command: VisualDiffCommand) -> dict:
+        logger.info("Request: compare_screenshots")
+        return await getBrowserManager().compareScreenshots(
+            command.before,
+            command.after,
+            pixelThreshold=command.pixelThreshold,
+            saveDiff=command.saveDiff,
+        )
+
+    # ----------------------------------------------------------------- #
+    # Browser-state snapshot (cookies + storage + open tabs)
+    # ----------------------------------------------------------------- #
+    @app.post("/snapshot/create")
+    async def createSnapshot(command: SnapshotCreateCommand) -> dict:
+        logger.info("Request: create_snapshot")
+        return await getBrowserManager().createSnapshot(savePath=command.savePath)
+
+    @app.post("/snapshot/restore")
+    async def restoreSnapshot(command: SnapshotRestoreCommand) -> dict:
+        logger.info("Request: restore_snapshot")
+        return await getBrowserManager().restoreSnapshot(
+            path=command.path, navigate=command.navigate
+        )
+
+    # ----------------------------------------------------------------- #
+    # Session replay (structured action log — not video)
+    # ----------------------------------------------------------------- #
+    @app.post("/session/start")
+    async def startSession(command: SessionStartCommand) -> dict:
+        logger.info("Request: start_session")
+        return await getBrowserManager().startSession(command.name)
+
+    @app.post("/session/stop")
+    async def stopSession() -> dict:
+        logger.info("Request: stop_session")
+        return await getBrowserManager().stopSession()
+
+    @app.get("/session")
+    async def getSession() -> dict:
+        logger.info("Request: get_session")
+        return await getBrowserManager().getSession()
+
+    @app.post("/session/save")
+    async def saveSession(command: SessionSaveCommand) -> dict:
+        logger.info("Request: save_session")
+        return await getBrowserManager().saveSession(command.path)
+
+    @app.post("/session/load")
+    async def loadSession(command: SessionLoadCommand) -> dict:
+        logger.info("Request: load_session")
+        return await getBrowserManager().loadSession(command.path)
+
+    @app.post("/session/replay")
+    async def replaySession(command: ReplaySessionCommand) -> dict:
+        logger.info("Request: replay_session")
+        return await getBrowserManager().replaySession(
+            path=command.path, delayMs=command.delayMs, continueOnError=command.continueOnError
+        )
+
+    # ----------------------------------------------------------------- #
+    # Browser memory
+    # ----------------------------------------------------------------- #
+    @app.post("/memory/remember")
+    async def rememberPage(command: RememberPageCommand) -> dict:
+        logger.info("Request: remember_page")
+        return await getBrowserManager().rememberPage(
+            tags=command.tags, withScreenshot=command.withScreenshot
+        )
+
+    @app.post("/memory/search")
+    async def searchMemory(command: MemorySearchCommand) -> dict:
+        logger.info("Request: search_memory -> %s", command.query)
+        return await getBrowserManager().searchMemory(command.query, limit=command.limit)
+
+    @app.get("/memory")
+    async def listMemory(limit: int = 50) -> dict:
+        logger.info("Request: list_memory")
+        return await getBrowserManager().listMemory(limit=limit)
+
+    @app.post("/memory/clear")
+    async def clearMemory() -> dict:
+        logger.info("Request: clear_memory")
+        return await getBrowserManager().clearMemory()
+
+    # ----------------------------------------------------------------- #
+    # Website Skill System (persistent per-domain operational knowledge)
+    # ----------------------------------------------------------------- #
+    @app.post("/skills/discover/page")
+    async def discoverPage(command: DiscoverPageCommand) -> dict:
+        logger.info("Request: discover_page -> %s", command.url)
+        return await getBrowserManager().discoverPage(command.url)
+
+    @app.post("/skills/discover/website")
+    async def discoverWebsite(command: DiscoverWebsiteCommand) -> dict:
+        logger.info("Request: discover_website -> %s", command.startUrl)
+        return await getBrowserManager().discoverWebsite(
+            startUrl=command.startUrl, maxPages=command.maxPages
+        )
+
+    @app.post("/skills/update")
+    async def updateSkill(command: UpdateSkillCommand) -> dict:
+        logger.info("Request: update_skill -> %s", command.url)
+        return await getBrowserManager().updateSkill(
+            command.url, success=command.success, confidenceDelta=command.confidenceDelta
+        )
+
+    @app.get("/skills")
+    async def listSkills(domain: str | None = None) -> dict:
+        logger.info("Request: list_skills")
+        return await getBrowserManager().listSkills(domain)
+
+    @app.post("/skills/search")
+    async def searchSkills(command: SkillSearchCommand) -> dict:
+        logger.info("Request: search_skills -> %s", command.query)
+        return await getBrowserManager().searchSkills(command.query, limit=command.limit)
+
+    @app.post("/skills/export")
+    async def exportSkills(command: ExportSkillsCommand) -> dict:
+        logger.info("Request: export_skills")
+        return await getBrowserManager().exportSkills(command.domain, savePath=command.savePath)
+
+    @app.post("/skills/import")
+    async def importSkills(command: ImportSkillsCommand) -> dict:
+        logger.info("Request: import_skills")
+        return await getBrowserManager().importSkills(
+            bundle=command.bundle, path=command.path, overwrite=command.overwrite
+        )
+
+    @app.post("/skills/clear")
+    async def clearSkills(domain: str | None = None) -> dict:
+        logger.info("Request: clear_skills")
+        return await getBrowserManager().clearSkills(domain)
+
+    @app.post("/skills/mode")
+    async def setDiscoveryMode(command: DiscoveryModeCommand) -> dict:
+        logger.info("Request: set_discovery_mode -> %s", command.mode)
+        return await getBrowserManager().setDiscoveryMode(command.mode)
+
+    @app.get("/skills/status")
+    async def getDiscoveryStatus() -> dict:
+        logger.info("Request: get_discovery_status")
+        return await getBrowserManager().getDiscoveryStatus()
+
+    # ----------------------------------------------------------------- #
+    # OCR
+    # ----------------------------------------------------------------- #
+    @app.post("/ocr/screenshot")
+    async def extractTextFromScreenshot(command: OcrScreenshotCommand) -> dict:
+        logger.info("Request: extract_text_from_screenshot")
+        return await getBrowserManager().extractTextFromScreenshot(
+            fullPage=command.fullPage, selector=command.selector, lang=command.lang
+        )
+
+    @app.post("/ocr/image")
+    async def readImage(command: ReadImageCommand) -> dict:
+        logger.info("Request: read_image -> %s", command.source)
+        return await getBrowserManager().readImage(command.source, lang=command.lang)
+
+    # ----------------------------------------------------------------- #
+    # AI judgment (provider-backed)
+    # ----------------------------------------------------------------- #
+    @app.post("/ai/verify-goal")
+    async def verifyGoal(command: VerifyGoalCommand) -> dict:
+        logger.info("Request: verify_goal")
+        return await getBrowserManager().verifyGoal(command.goal, fullPage=command.fullPage)
+
+    @app.post("/ai/find-element")
+    async def findElement(command: FindElementCommand) -> dict:
+        logger.info("Request: find_element -> %s", command.description)
+        return await getBrowserManager().findElement(command.description, limit=command.limit)
+
+    @app.post("/ai/click-by-description")
+    async def clickByDescription(command: ClickByDescriptionCommand) -> dict:
+        logger.info("Request: click_by_description -> %s", command.description)
+        return await getBrowserManager().clickByDescription(
+            command.description, limit=command.limit, humanize=command.humanize
+        )
+
+    @app.post("/ai/plan")
+    async def planActions(command: PlanActionsCommand) -> dict:
+        logger.info("Request: plan_actions")
+        return await getBrowserManager().planActions(
+            command.goal, includeContext=command.includeContext
+        )
+
+    # ----------------------------------------------------------------- #
+    # Workflows (named saved sessions)
+    # ----------------------------------------------------------------- #
+    @app.post("/workflows/save")
+    async def saveWorkflow(command: WorkflowCommand) -> dict:
+        logger.info("Request: save_workflow -> %s", command.name)
+        return await getBrowserManager().saveWorkflow(command.name)
+
+    @app.get("/workflows")
+    async def listWorkflows() -> dict:
+        logger.info("Request: list_workflows")
+        return await getBrowserManager().listWorkflows()
+
+    @app.post("/workflows/run")
+    async def runWorkflow(command: RunWorkflowCommand) -> dict:
+        logger.info("Request: run_workflow -> %s", command.name)
+        return await getBrowserManager().runWorkflow(
+            command.name, delayMs=command.delayMs, continueOnError=command.continueOnError
+        )
+
+    # ----------------------------------------------------------------- #
+    # Browser sessions (pool of isolated browsers)
+    # ----------------------------------------------------------------- #
+    @app.get("/sessions")
+    async def getSessions() -> dict:
+        logger.info("Request: list_sessions")
+        return listSessions()
+
+    @app.post("/sessions/create")
+    async def makeSession(command: SessionCreateCommand) -> dict:
+        logger.info("Request: create_session")
+        return createSession(command.sessionId, makeActive=command.makeActive)
+
+    @app.post("/sessions/switch")
+    async def switchToSession(command: SessionSwitchCommand) -> dict:
+        logger.info("Request: switch_session -> %s", command.sessionId)
+        return switchSession(command.sessionId)
+
+    @app.post("/sessions/close")
+    async def closeSessionEndpoint(command: SessionSwitchCommand | None = None) -> dict:
+        logger.info("Request: close_session")
+        sessionId = command.sessionId if command else None
+        return await closeSession(sessionId)
+
+    # ----------------------------------------------------------------- #
     # Global error handlers — no request ever returns a raw stack trace.
     # Every failure becomes the same AI-friendly envelope the endpoints use.
     # ----------------------------------------------------------------- #
@@ -420,6 +802,13 @@ def createApp() -> FastAPI:
     # WebSocket route (contributed by app.api.websocket)
     # ----------------------------------------------------------------- #
     registerWebSocket(app)
+
+    # ----------------------------------------------------------------- #
+    # Studio dashboard — live thinking window + mid-task steering (GET /studio)
+    # ----------------------------------------------------------------- #
+    from app.api.studio import router as studioRouter
+
+    app.include_router(studioRouter)
 
     return app
 

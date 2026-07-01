@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Browser Agent Studio</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: #0f1115; color: #e6e6e6; height: 100vh; display: flex; flex-direction: column;
+  }
+  header { padding: 14px 18px; border-bottom: 1px solid #232733; }
+  header h1 { margin: 0; font-size: 16px; font-weight: 600; }
+  header small { color: #8a93a6; }
+  .row { display: flex; gap: 8px; padding: 12px 18px; }
+  input[type=text] {
+    flex: 1; padding: 10px 12px; border-radius: 8px; border: 1px solid #2c3140;
+    background: #161a22; color: #e6e6e6; font-size: 14px;
+  }
+  input[type=text]:disabled { opacity: .5; }
+  button {
+    padding: 10px 16px; border-radius: 8px; border: 0; font-size: 14px; font-weight: 600;
+    background: #3b82f6; color: #fff; cursor: pointer;
+  }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  #log { flex: 1; overflow-y: auto; padding: 8px 18px 18px; }
+  .line { padding: 6px 10px; margin: 4px 0; border-radius: 8px; background: #161a22; border-left: 3px solid #2c3140; }
+  .line .tag { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: #8a93a6; margin-right: 8px; }
+  .action { border-left-color: #3b82f6; }
+  .result { border-left-color: #2f6f4f; color: #b8c7bd; }
+  .thought { border-left-color: #8b5cf6; }
+  .feedback { border-left-color: #eab308; background: #1d1a10; }
+  .status  { border-left-color: #4b5563; color: #9aa3b2; }
+  .done    { border-left-color: #22c55e; background: #11201a; }
+  .error   { border-left-color: #ef4444; background: #221314; color: #f3b1b1; }
+  .conn { font-size: 12px; color: #8a93a6; padding: 0 18px 10px; }
+</style>
+</head>
+<body>
+  <header>
+    <h1>Browser Agent Studio <small>— watch &amp; steer the Gemini agent</small></h1>
+  </header>
+
+  <div class="row">
+    <input id="task" type="text" placeholder="e.g. ask chatgpt to generate a scenery and download the image" />
+    <button id="run">Run</button>
+  </div>
+
+  <div id="log"></div>
+
+  <div class="row">
+    <input id="feedback" type="text" placeholder="Type a correction while it runs… (e.g. use chatgpt, not dalle)" disabled />
+    <button id="send" disabled>Send</button>
+  </div>
+  <div class="conn" id="conn">connecting…</div>
+
+<script>
+(function () {
+  const $ = (id) => document.getElementById(id);
+  const log = $("log"), taskInput = $("task"), runBtn = $("run");
+  const fbInput = $("feedback"), sendBtn = $("send"), conn = $("conn");
+  let running = false;
+
+  function line(type, text) {
+    const el = document.createElement("div");
+    el.className = "line " + type;
+    const tag = document.createElement("span");
+    tag.className = "tag";
+    tag.textContent = type;
+    el.appendChild(tag);
+    el.appendChild(document.createTextNode(text || ""));
+    log.appendChild(el);
+    log.scrollTop = log.scrollHeight;
+  }
+
+  function setRunning(on) {
+    running = on;
+    runBtn.disabled = on;
+    taskInput.disabled = on;
+    fbInput.disabled = !on;
+    sendBtn.disabled = !on;
+  }
+
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  const ws = new WebSocket(`${proto}://${location.host}/studio/ws`);
+
+  ws.onopen = () => { conn.textContent = "connected"; };
+  ws.onclose = () => { conn.textContent = "disconnected — reload to reconnect"; setRunning(false); };
+  ws.onerror = () => { conn.textContent = "connection error"; };
+
+  ws.onmessage = (ev) => {
+    let m; try { m = JSON.parse(ev.data); } catch { return; }
+    if (m.type === "done") {
+      line("done", m.text ? `Finished: ${m.text}` : `Finished (${m.turns} turns).`);
+      setRunning(false);
+      return;
+    }
+    line(m.type || "status", m.text || "");
+    if (m.type === "error" && !running) setRunning(false);
+  };
+
+  function start() {
+    const task = taskInput.value.trim();
+    if (!task || running || ws.readyState !== WebSocket.OPEN) return;
+    log.innerHTML = "";            // fresh log per task (matches per-task context isolation)
+    setRunning(true);
+    ws.send(JSON.stringify({ type: "start", task }));
+  }
+  function sendFeedback() {
+    const text = fbInput.value.trim();
+    if (!text || !running) return;
+    ws.send(JSON.stringify({ type: "feedback", text }));
+    fbInput.value = "";
+  }
+
+  runBtn.onclick = start;
+  taskInput.addEventListener("keydown", (e) => { if (e.key === "Enter") start(); });
+  sendBtn.onclick = sendFeedback;
+  fbInput.addEventListener("keydown", (e) => { if (e.key === "Enter") sendFeedback(); });
+})();
+</script>
+</body>
+</html>

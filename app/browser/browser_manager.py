@@ -17,11 +17,23 @@ session instead of returning a process-wide singleton.
 from __future__ import annotations
 
 import asyncio
+import json
+import re
 from pathlib import Path
 from typing import Any, Awaitable, Callable
+from urllib.parse import urlsplit
 
+from app.browser import intelligence
+from app.browser import media
+from app.browser import ocr
+from app.browser import visual_diff
+from app.browser.discovery_engine import getDiscoveryEngine
+from app.browser.page_memory import getPageMemory
+from app.browser.website_skills import getWebsiteSkillManager
 from app.browser.playwright_controller import PlaywrightController
+from app.browser.profiles import getProfileManager
 from app.browser.screenshot_manager import ScreenshotManager
+from app.browser.session_recorder import SessionRecorder
 from app.browser.video_recorder import VideoRecorder
 from app.utils.config import settings
 from app.utils.error_handler import BrowserNotRunningError, buildErrorEnvelope
@@ -35,19 +47,48 @@ class BrowserManager:
     """Process-wide coordinator returning enveloped results for every action."""
 
     def __init__(self) -> None:
-        self.controller = PlaywrightController()
+        # The ACTIVE controller — the Playwright engine that drives a real,
+        # automatable Chrome/Chromium. Every action method calls
+        # ``self.controller.X(...)``, keeping the whole tool surface in one place.
+        self._playwrightController = PlaywrightController()
+        self.controller = self._playwrightController
+        # Retained for the ``status`` envelope; the controller is always Playwright.
+        self.backendName: str = "playwright"
         self.screenshots = ScreenshotManager()
         self.recorder = VideoRecorder()
+        # Structured action log (replayable JSON), distinct from the video recorder.
+        self.session = SessionRecorder()
+        self.profiles = getProfileManager()
+        # Website Skill System: persistent per-domain operational knowledge. The
+        # manager is the facade; this delegate owns all skill logic (req: don't
+        # mix discovery into BrowserManager). Discovery runs the staged crawler.
+        self.skills = getWebsiteSkillManager()
+        self.discovery = getDiscoveryEngine()
+        # Global "no-image mode": when on, pixel screenshots are suppressed in
+        # favour of MarkItDown text. Starts from the configured default.
+        self.noImageMode: bool = settings.noImageMode
         self._lock = asyncio.Lock()
 
     # ------------------------------------------------------------------ #
     # Envelope plumbing
     # ------------------------------------------------------------------ #
-    async def _run(self, action: str, coro: Callable[[], Awaitable[dict[str, Any]]]) -> dict[str, Any]:
-        """Execute *coro* under the lock and wrap the outcome in an envelope."""
+    async def _run(
+        self,
+        action: str,
+        coro: Callable[[], Awaitable[dict[str, Any]]],
+        recordParams: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Execute *coro* under the lock and wrap the outcome in an envelope.
+
+        When *recordParams* is supplied the action is replayable: on success it is
+        appended to the active session recording (a no-op if not recording). Only
+        successful actions are logged, so a replay never reproduces a failed step.
+        """
         async with self._lock:
             try:
                 data = await coro()
+                if recordParams is not None:
+                    self.session.record(action, recordParams)
                 return successResponse(action, data)
             except Exception as exc:  # noqa: BLE001 - surfaced as structured error
                 logger.exception("Action '%s' failed", action)
@@ -63,19 +104,151 @@ class BrowserManager:
     # Lifecycle
     # ------------------------------------------------------------------ #
     async def openBrowser(self, **kwargs: Any) -> dict[str, Any]:
-        return await self._run(
-            "open_browser",
-            lambda: self.controller.launchBrowser(
+        async def op() -> dict[str, Any]:
+            profile = kwargs.get("profile")
+            resolved = self._resolveProfile(profile)
+            if resolved is None:
+                # No profile chosen and none active yet -> ask the user which to
+                # use (req 7). The driving agent surfaces this to the human.
+                return self._profileSelectionPayload()
+            name, userDataDir = resolved
+            self.profiles.setActiveProfile(name)
+            return await self.controller.launchBrowser(
                 browserType=kwargs.get("browserType", settings.browserType),
                 headless=kwargs.get("headless", settings.headless),
                 viewportWidth=kwargs.get("viewportWidth"),
                 viewportHeight=kwargs.get("viewportHeight"),
                 userAgent=kwargs.get("userAgent"),
-            ),
-        )
+                userDataDir=userDataDir,
+                profileName=name,
+                channel=kwargs.get("channel", settings.browserChannel),
+            )
+
+        return await self._run("open_browser", op)
 
     async def closeBrowser(self) -> dict[str, Any]:
         return await self._run("close_browser", self.controller.closeBrowser)
+
+    # ------------------------------------------------------------------ #
+    # Profiles (multi-account; the active one persists across chats)
+    # ------------------------------------------------------------------ #
+    def _resolveProfile(self, profile: str | None) -> tuple[str, "Path"] | None:
+        """Resolve which profile to launch.
+
+        Returns ``(name, userDataDir)`` for an explicit profile, ``"random"``, or
+        the persisted active profile. Returns ``None`` when nothing is chosen and
+        no active profile exists yet (caller should prompt the user).
+        """
+        if profile == "random":
+            name = self.profiles.chooseRandom()
+        elif profile:
+            name = profile
+        else:
+            name = self.profiles.getActiveProfile()
+            if not name:
+                return None
+        return name, self.profiles.resolveDir(name)
+
+    def _profileSelectionPayload(self) -> dict[str, Any]:
+        """Data telling the agent to ask the user which profile to use."""
+        profiles = self.profiles.listProfiles()
+        return {
+            "status": "profile_selection_required",
+            "message": (
+                "No browser profile is selected yet. Ask the user which profile to "
+                "use, or whether to choose one at random. If you have a tool to ask "
+                "the user (e.g. AskUserQuestion), use it; otherwise present these "
+                "options and wait for their reply. Then call open_browser with "
+                "profile=<name> or profile='random', or select_profile first."
+            ),
+            "profiles": profiles,
+            "options": [p["name"] for p in profiles] + ["random", "create a new one"],
+        }
+
+    async def listProfiles(self) -> dict[str, Any]:
+        async def op() -> dict[str, Any]:
+            return {
+                "profiles": self.profiles.listProfiles(),
+                "active": self.profiles.getActiveProfile(),
+            }
+
+        return await self._run("list_profiles", op)
+
+    async def selectProfile(self, name: str) -> dict[str, Any]:
+        async def op() -> dict[str, Any]:
+            chosen = self.profiles.chooseRandom() if name == "random" else name
+            info = self.profiles.setActiveProfile(chosen)
+            return {"active": info["active"], "path": info["path"]}
+
+        return await self._run("select_profile", op)
+
+    async def createProfile(self, name: str, makeActive: bool = False) -> dict[str, Any]:
+        async def op() -> dict[str, Any]:
+            info = self.profiles.createProfile(name)
+            if makeActive:
+                self.profiles.setActiveProfile(info["name"])
+            return {**info, "active": self.profiles.getActiveProfile()}
+
+        return await self._run("create_profile", op)
+
+    async def getActiveProfile(self) -> dict[str, Any]:
+        return await self._run(
+            "get_active_profile",
+            lambda: self._async({"active": self.profiles.getActiveProfile()}),
+        )
+
+    async def loginSession(self, profile: str | None = None, url: str | None = None) -> dict[str, Any]:
+        """Open a HEADED browser on a chosen/new profile for manual login/signup.
+
+        Use when a site needs a real human to log in or create an account (Google,
+        etc.) before the agent can automate it. The window is visible so the user
+        can type credentials / solve captchas; the persistent profile saves the
+        resulting session for all future automated runs.
+        """
+        async def op() -> dict[str, Any]:
+            name = self.profiles.chooseRandom() if profile == "random" else (profile or "")
+            if not name:
+                return self._profileSelectionPayload()
+            self.profiles.setActiveProfile(name)
+            if self.controller.isRunning:
+                await self.controller.closeBrowser()
+            snapshot = await self.controller.launchBrowser(
+                browserType=settings.browserType,
+                headless=False,  # must be visible for a human to act
+                userDataDir=self.profiles.resolveDir(name),
+                profileName=name,
+                channel=settings.browserChannel,
+            )
+            if url:
+                await self.controller.openUrl(url, waitUntil="domcontentloaded")
+                snapshot["url"] = url
+            snapshot["loginReady"] = True
+            snapshot["note"] = (
+                "Headed window open. The user should log in / sign up now; the "
+                "session is saved to the profile for future automated runs."
+            )
+            return snapshot
+
+        return await self._run("login_session", op)
+
+    async def setStealth(self, enabled: bool) -> dict[str, Any]:
+        """Toggle stealth (anti-bot fingerprinting hardening) as a launch default."""
+        async def op() -> dict[str, Any]:
+            # Playwright applies stealth at launch from settings; update the
+            # in-memory default so the next launch honours the choice.
+            settings.stealth = enabled
+            return {"stealth": enabled, "backend": "playwright"}
+
+        return await self._run("set_stealth", op)
+
+    async def setHumanize(self, enabled: bool) -> dict[str, Any]:
+        """Toggle humanized (human-like) input as the default for click/fill/scroll."""
+        async def op() -> dict[str, Any]:
+            # Playwright reads the humanize default from settings per action.
+            settings.humanize = enabled
+            return {"humanize": enabled, "backend": "playwright"}
+
+        return await self._run("set_humanize", op)
 
     async def setHeadless(self, headless: bool) -> dict[str, Any]:
         """Switch a running browser between headless and headed (state preserved)."""
@@ -91,33 +264,88 @@ class BrowserManager:
     async def navigate(self, url: str, waitUntil: str = "networkidle", timeoutMs: int | None = None) -> dict[str, Any]:
         async def op() -> dict[str, Any]:
             if not self.controller.isRunning:
+                # Auto-launch uses the active profile if one is set, otherwise the
+                # 'default' profile — so navigate never hard-blocks. Deliberate
+                # profile selection happens via open_browser / select_profile.
+                name = self.profiles.getActiveProfile() or self.profiles.chooseRandom()
+                self.profiles.setActiveProfile(name)
                 await self.controller.launchBrowser(
-                    browserType=settings.browserType, headless=settings.headless
+                    browserType=settings.browserType,
+                    headless=settings.headless,
+                    userDataDir=self.profiles.resolveDir(name),
+                    profileName=name,
+                    channel=settings.browserChannel,
                 )
-            return await self.controller.openUrl(url, waitUntil=waitUntil, timeoutMs=timeoutMs)
+            result = await self.controller.openUrl(url, waitUntil=waitUntil, timeoutMs=timeoutMs)
+            # Website Skill System: load known knowledge for this page (and, in
+            # LEARN mode, auto-discover when the route is new or low-confidence)
+            # so the driving AI has operational context before it reasons.
+            result["skill"] = await self._onNavigated(result.get("url") or url)
+            return result
 
-        return await self._run("navigate", op)
+        return await self._run(
+            "navigate", op, recordParams={"url": url, "waitUntil": waitUntil, "timeoutMs": timeoutMs}
+        )
+
+    async def _onNavigated(self, url: str) -> dict[str, Any]:
+        """Skill hook fired after a successful navigation (req: auto, no user action).
+
+        Runs inside ``navigate``'s lock, so it must touch the controller DIRECTLY
+        (never re-enter manager methods, which would deadlock the non-reentrant
+        lock). Loads the route skill; in LEARN mode it discovers an unknown or
+        stale route and saves it. Failures never break navigation.
+        """
+        try:
+            self.skills.recordVisit(url)
+            loaded = self.skills.loadForUrl(url)
+            shouldLearn = (
+                self.skills.mode == "LEARN"
+                and settings.discoveryAutoUpdate
+                and (not loaded.get("routeKnown") or loaded.get("needsRediscovery"))
+            )
+            if shouldLearn:
+                discovery = await self.discovery.discoverPage(self.controller)
+                saved = self.skills.saveDiscovery(url, discovery)
+                loaded = self.skills.loadForUrl(url)
+                loaded["discovered"] = saved
+            return loaded
+        except Exception as exc:  # noqa: BLE001 - skills are best-effort context
+            logger.warning("Skill hook failed for %s: %s", url, exc)
+            return {"known": False, "error": str(exc)}
 
     async def navigateBack(self) -> dict[str, Any]:
-        return await self._run("navigate_back", self._guard(self.controller.navigateBack))
+        return await self._run("navigate_back", self._guard(self.controller.navigateBack), recordParams={})
 
     async def navigateForward(self) -> dict[str, Any]:
-        return await self._run("navigate_forward", self._guard(self.controller.navigateForward))
+        return await self._run("navigate_forward", self._guard(self.controller.navigateForward), recordParams={})
 
     async def refresh(self) -> dict[str, Any]:
-        return await self._run("refresh", self._guard(self.controller.refreshPage))
+        return await self._run("refresh", self._guard(self.controller.refreshPage), recordParams={})
 
     # ------------------------------------------------------------------ #
     # Tabs
     # ------------------------------------------------------------------ #
     async def openNewTab(self, url: str | None = None) -> dict[str, Any]:
-        return await self._run("open_new_tab", self._guard(lambda: self.controller.openNewTab(url)))
+        return await self._run(
+            "open_new_tab", self._guard(lambda: self.controller.openNewTab(url)),
+            recordParams={"url": url},
+        )
 
     async def switchTab(self, index: int) -> dict[str, Any]:
-        return await self._run("switch_tab", self._guard(lambda: self.controller.switchTab(index)))
+        return await self._run(
+            "switch_tab", self._guard(lambda: self.controller.switchTab(index)),
+            recordParams={"index": index},
+        )
 
     async def closeTab(self, index: int | None = None) -> dict[str, Any]:
-        return await self._run("close_tab", self._guard(lambda: self.controller.closeTab(index)))
+        return await self._run(
+            "close_tab", self._guard(lambda: self.controller.closeTab(index)),
+            recordParams={"index": index},
+        )
+
+    async def getTabs(self) -> dict[str, Any]:
+        """Summarise every open tab — index, title, URL, host, and which is active."""
+        return await self._run("get_tabs", self._guard(self.controller.getTabs))
 
     # ------------------------------------------------------------------ #
     # Extraction / info
@@ -159,29 +387,44 @@ class BrowserManager:
                     selector=kwargs.get("selector"),
                     toTop=kwargs.get("toTop", False),
                     toBottom=kwargs.get("toBottom", False),
+                    humanize=kwargs.get("humanize"),
                 )
             ),
+            recordParams=kwargs,
         )
 
     async def hover(self, selector: str, timeoutMs: int | None = None) -> dict[str, Any]:
-        return await self._run("hover", self._guard(lambda: self.controller.hoverElement(selector, timeoutMs)))
-
-    async def click(self, selector: str, button: str = "left", clickCount: int = 1, timeoutMs: int | None = None) -> dict[str, Any]:
         return await self._run(
-            "click",
-            self._guard(lambda: self.controller.clickElement(selector, button, clickCount, timeoutMs)),
+            "hover", self._guard(lambda: self.controller.hoverElement(selector, timeoutMs)),
+            recordParams={"selector": selector, "timeoutMs": timeoutMs},
         )
 
-    async def doubleClick(self, selector: str, timeoutMs: int | None = None) -> dict[str, Any]:
-        return await self._run("double_click", self._guard(lambda: self.controller.doubleClickElement(selector, timeoutMs)))
+    async def click(self, selector: str, button: str = "left", clickCount: int = 1, timeoutMs: int | None = None, humanize: bool | None = None) -> dict[str, Any]:
+        return await self._run(
+            "click",
+            self._guard(lambda: self.controller.clickElement(selector, button, clickCount, timeoutMs, humanize)),
+            recordParams={"selector": selector, "button": button, "clickCount": clickCount,
+                          "timeoutMs": timeoutMs, "humanize": humanize},
+        )
 
-    async def rightClick(self, selector: str, timeoutMs: int | None = None) -> dict[str, Any]:
-        return await self._run("right_click", self._guard(lambda: self.controller.rightClickElement(selector, timeoutMs)))
+    async def doubleClick(self, selector: str, timeoutMs: int | None = None, humanize: bool | None = None) -> dict[str, Any]:
+        return await self._run(
+            "double_click", self._guard(lambda: self.controller.doubleClickElement(selector, timeoutMs, humanize)),
+            recordParams={"selector": selector, "timeoutMs": timeoutMs, "humanize": humanize},
+        )
 
-    async def fill(self, selector: str, value: str, clearFirst: bool = True, timeoutMs: int | None = None) -> dict[str, Any]:
+    async def rightClick(self, selector: str, timeoutMs: int | None = None, humanize: bool | None = None) -> dict[str, Any]:
+        return await self._run(
+            "right_click", self._guard(lambda: self.controller.rightClickElement(selector, timeoutMs, humanize)),
+            recordParams={"selector": selector, "timeoutMs": timeoutMs, "humanize": humanize},
+        )
+
+    async def fill(self, selector: str, value: str, clearFirst: bool = True, timeoutMs: int | None = None, humanize: bool | None = None) -> dict[str, Any]:
         return await self._run(
             "fill",
-            self._guard(lambda: self.controller.fillInput(selector, value, clearFirst, timeoutMs)),
+            self._guard(lambda: self.controller.fillInput(selector, value, clearFirst, timeoutMs, humanize)),
+            recordParams={"selector": selector, "value": value, "clearFirst": clearFirst,
+                          "timeoutMs": timeoutMs, "humanize": humanize},
         )
 
     async def selectOption(self, selector: str, value: str | None = None, label: str | None = None, timeoutMs: int | None = None) -> dict[str, Any]:
@@ -191,22 +434,45 @@ class BrowserManager:
         )
 
     async def uploadFile(self, selector: str, filePaths: list[str]) -> dict[str, Any]:
-        return await self._run("upload_file", self._guard(lambda: self.controller.uploadFile(selector, filePaths)))
+        return await self._run(
+            "upload_file", self._guard(lambda: self.controller.uploadFile(selector, filePaths)),
+            recordParams={"selector": selector, "filePaths": filePaths},
+        )
 
-    async def downloadFile(self, selector: str, saveDir: str | None = None, timeoutMs: int | None = None) -> dict[str, Any]:
-        return await self._run("download_file", self._guard(lambda: self.controller.downloadFile(selector, saveDir, timeoutMs)))
+    async def downloadFile(self, selector: str, saveDir: str | None = None, timeoutMs: int | None = None, imagesOnly: bool = True) -> dict[str, Any]:
+        return await self._run("download_file", self._guard(lambda: self.controller.downloadFile(selector, saveDir, timeoutMs, imagesOnly)))
 
     async def pressKeys(self, keys: str, selector: str | None = None) -> dict[str, Any]:
-        return await self._run("press_keys", self._guard(lambda: self.controller.pressKeys(keys, selector)))
+        return await self._run(
+            "press_keys", self._guard(lambda: self.controller.pressKeys(keys, selector)),
+            recordParams={"keys": keys, "selector": selector},
+        )
 
     # ------------------------------------------------------------------ #
     # Waits
     # ------------------------------------------------------------------ #
     async def waitForElement(self, selector: str, state: str = "visible", timeoutMs: int | None = None) -> dict[str, Any]:
-        return await self._run("wait_for_element", self._guard(lambda: self.controller.waitForElement(selector, state, timeoutMs)))
+        return await self._run(
+            "wait_for_element", self._guard(lambda: self.controller.waitForElement(selector, state, timeoutMs)),
+            recordParams={"selector": selector, "state": state, "timeoutMs": timeoutMs},
+        )
 
     async def waitForNetworkIdle(self, timeoutMs: int | None = None) -> dict[str, Any]:
         return await self._run("wait_for_network_idle", self._guard(lambda: self.controller.waitForNetworkIdle(timeoutMs)))
+
+    async def waitForStable(self, selector: str, stableMs: int = 1200, timeoutMs: int | None = None) -> dict[str, Any]:
+        """Wait until a selector's text stops changing (e.g. a streamed AI answer)."""
+        return await self._run(
+            "wait_for_stable",
+            self._guard(lambda: self.controller.waitForStable(selector, stableMs, timeoutMs)),
+        )
+
+    async def waitForResponse(self, urlPattern: str, timeoutMs: int | None = None, includeQuery: bool = False) -> dict[str, Any]:
+        """Wait until a network response matching ``urlPattern`` finishes streaming."""
+        return await self._run(
+            "wait_for_response",
+            self._guard(lambda: self.controller.waitForResponse(urlPattern, timeoutMs, includeQuery)),
+        )
 
     # ------------------------------------------------------------------ #
     # Visual intelligence
@@ -218,6 +484,8 @@ class BrowserManager:
         annotate: bool = False,
         label: str | None = None,
     ) -> dict[str, Any]:
+        if self.noImageMode:
+            return await self._run("take_screenshot", lambda: self._async(self._noImageNotice()))
         return await self._run(
             "take_screenshot",
             self._guard(
@@ -239,6 +507,8 @@ class BrowserManager:
         Used by the MCP ``screenshot`` tool so an AI can *see* the page inline
         without persisting anything to disk.
         """
+        if self.noImageMode:
+            return await self._run("screenshot", lambda: self._async(self._noImageNotice()))
         return await self._run(
             "screenshot",
             self._guard(
@@ -247,6 +517,44 @@ class BrowserManager:
                 )
             ),
         )
+
+    # ------------------------------------------------------------------ #
+    # No-image mode (MarkItDown) — read text instead of pixels
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _noImageNotice() -> dict[str, Any]:
+        return {
+            "noImageMode": True,
+            "note": (
+                "No-image mode is ON, so screenshots are suppressed. Use read_page "
+                "for the page's text, or to_markdown(<image/pdf/url>) to convert "
+                "media to markdown. Turn this off with set_no_image_mode(false)."
+            ),
+        }
+
+    async def setNoImageMode(self, enabled: bool) -> dict[str, Any]:
+        """Toggle global no-image mode (suppress screenshots, prefer markdown)."""
+        async def op() -> dict[str, Any]:
+            self.noImageMode = enabled
+            return {
+                "noImageMode": enabled,
+                "markitdownAvailable": media.markitdownAvailable(),
+                # Honest per-format picture: base MarkItDown may be present while
+                # PDF/Office backends are not.
+                "markitdownFormats": media.markitdownFormats(),
+            }
+
+        return await self._run("set_no_image_mode", op)
+
+    async def toMarkdown(self, source: str) -> dict[str, Any]:
+        """Convert an image/PDF/Office/HTML file or URL to markdown via MarkItDown."""
+        async def op() -> dict[str, Any]:
+            result = media.toMarkdown(source)
+            if "error" in result:
+                raise ValueError(f"{result['error']}: {result.get('details', '')}")
+            return result
+
+        return await self._run("to_markdown", op)
 
     # ------------------------------------------------------------------ #
     # Storage maintenance
@@ -329,12 +637,539 @@ class BrowserManager:
         return await self._run("read_page", self._guard(op))
 
     # ------------------------------------------------------------------ #
+    # Accessibility / page audit
+    # ------------------------------------------------------------------ #
+    async def getAccessibilityTree(
+        self, interestingOnly: bool = True, root: str | None = None
+    ) -> dict[str, Any]:
+        """Return the page's accessibility tree (roles/names a screen reader sees)."""
+        return await self._run(
+            "get_accessibility_tree",
+            self._guard(lambda: self.controller.getAccessibilityTree(interestingOnly, root)),
+        )
+
+    async def auditPage(self, sampleLimit: int = 400) -> dict[str, Any]:
+        """Audit the page for overflow, hidden controls, broken images, low contrast."""
+        return await self._run(
+            "audit_page", self._guard(lambda: self.controller.auditPage(sampleLimit))
+        )
+
+    # ------------------------------------------------------------------ #
+    # Visual diff (pure file comparison — no running browser required)
+    # ------------------------------------------------------------------ #
+    async def compareScreenshots(
+        self,
+        before: str,
+        after: str,
+        pixelThreshold: int = 60,
+        saveDiff: bool = False,
+    ) -> dict[str, Any]:
+        """Compare two screenshot files and quantify their visual difference."""
+        return await self._run(
+            "compare_screenshots",
+            lambda: self._async(
+                visual_diff.compareImages(before, after, pixelThreshold, saveDiff)
+            ),
+        )
+
+    # ------------------------------------------------------------------ #
+    # Browser-state snapshot (cookies + storage + open tabs)
+    # ------------------------------------------------------------------ #
+    async def createSnapshot(self, savePath: str | None = None) -> dict[str, Any]:
+        """Capture cookies/localStorage/sessionStorage/open-tabs; optionally save to JSON."""
+        async def op() -> dict[str, Any]:
+            self._requireRunning()
+            snapshot = await self.controller.createSnapshot()
+            result: dict[str, Any] = {
+                "cookieCount": len(snapshot.get("cookies", [])),
+                "localStorageKeys": len(snapshot.get("localStorage", {})),
+                "sessionStorageKeys": len(snapshot.get("sessionStorage", {})),
+                "tabCount": len(snapshot.get("tabs", [])),
+                "origin": snapshot.get("origin"),
+                "url": snapshot.get("url"),
+            }
+            # Always persist: a snapshot you can't restore later isn't useful.
+            target = (
+                Path(savePath)
+                if savePath
+                else settings.snapshotDir / f"snapshot-{snapshot['capturedAt'].replace(':', '-')}.json"
+            )
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
+            result["path"] = str(target)
+            return result
+
+        return await self._run("create_snapshot", op)
+
+    async def restoreSnapshot(
+        self, path: str | None = None, snapshot: dict[str, Any] | None = None, navigate: bool = True
+    ) -> dict[str, Any]:
+        """Restore cookies + storage from a saved snapshot file (or inline dict)."""
+        async def op() -> dict[str, Any]:
+            self._requireRunning()
+            data = snapshot
+            if data is None:
+                if not path:
+                    raise ValueError("Provide either 'path' to a saved snapshot or an inline 'snapshot'.")
+                source = Path(path)
+                if not source.exists():
+                    raise FileNotFoundError(f"Snapshot file not found: {path}")
+                data = json.loads(source.read_text(encoding="utf-8"))
+            return await self.controller.restoreSnapshot(data, navigate=navigate)
+
+        return await self._run("restore_snapshot", op)
+
+    # ------------------------------------------------------------------ #
+    # Session replay (structured, replayable action log — not video)
+    # ------------------------------------------------------------------ #
+    async def startSession(self, name: str | None = None) -> dict[str, Any]:
+        """Begin recording every replayable action to a structured session log."""
+        return await self._run("start_session", lambda: self._async(self.session.start(name)))
+
+    async def stopSession(self) -> dict[str, Any]:
+        """Stop the structured session recording and return its steps."""
+        return await self._run("stop_session", lambda: self._async(self.session.stop()))
+
+    async def saveSession(self, path: str | None = None) -> dict[str, Any]:
+        """Persist the current session to JSON for later load/replay."""
+        return await self._run("save_session", lambda: self._async(self.session.save(path)))
+
+    async def loadSession(self, path: str) -> dict[str, Any]:
+        """Load a saved session JSON into memory (ready to replay)."""
+        return await self._run("load_session", lambda: self._async(self.session.load(path)))
+
+    async def getSession(self) -> dict[str, Any]:
+        """Return the current in-memory session (steps + metadata)."""
+        return await self._run("get_session", lambda: self._async(self.session.snapshot()))
+
+    async def replaySession(
+        self,
+        path: str | None = None,
+        delayMs: int = 500,
+        continueOnError: bool = True,
+    ) -> dict[str, Any]:
+        """Re-run a recorded session's steps in order against the live browser.
+
+        Loads *path* first when given, otherwise replays the in-memory session.
+        Recording is paused during replay so replayed steps are not re-logged.
+        Each step's outcome is reported; with ``continueOnError`` a failed step is
+        recorded and replay proceeds, otherwise replay stops at the first failure.
+
+        Unlike other actions this does NOT run under ``_run``'s lock: every step
+        calls back into a manager method that acquires the lock itself, and
+        ``asyncio.Lock`` is not reentrant — holding it here would deadlock. The
+        per-step calls are still individually serialised by that same lock.
+        """
+        action = "replay_session"
+        try:
+            if path:
+                self.session.load(path)
+            steps = list(self.session.steps)
+            dispatch = self._replayDispatch()
+            results: list[dict[str, Any]] = []
+            self.session.paused = True
+            try:
+                for i, step in enumerate(steps):
+                    stepAction = step.get("action")
+                    params = step.get("params", {})
+                    handler = dispatch.get(stepAction)
+                    if handler is None:
+                        results.append({"step": i, "action": stepAction, "skipped": True,
+                                        "reason": "not a replayable action"})
+                        continue
+                    envelope = await handler(params)
+                    ok = bool(envelope.get("success"))
+                    results.append({"step": i, "action": stepAction, "success": ok,
+                                    "error": None if ok else envelope.get("error")})
+                    if not ok and not continueOnError:
+                        break
+                    if delayMs:
+                        await asyncio.sleep(delayMs / 1000)
+            finally:
+                self.session.paused = False
+            succeeded = sum(1 for r in results if r.get("success"))
+            return successResponse(
+                action, {"replayed": len(results), "succeeded": succeeded, "results": results}
+            )
+        except Exception as exc:  # noqa: BLE001 - surfaced as structured error
+            logger.exception("Action '%s' failed", action)
+            return buildErrorEnvelope(action, exc)
+
+    def _replayDispatch(self) -> dict[str, Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]]:
+        """Map replayable action names to manager calls (used only by replay)."""
+        return {
+            "navigate": lambda p: self.navigate(
+                p["url"], waitUntil=p.get("waitUntil", "networkidle"), timeoutMs=p.get("timeoutMs")
+            ),
+            "navigate_back": lambda p: self.navigateBack(),
+            "navigate_forward": lambda p: self.navigateForward(),
+            "refresh": lambda p: self.refresh(),
+            "open_new_tab": lambda p: self.openNewTab(p.get("url")),
+            "switch_tab": lambda p: self.switchTab(p["index"]),
+            "close_tab": lambda p: self.closeTab(p.get("index")),
+            "hover": lambda p: self.hover(p["selector"], timeoutMs=p.get("timeoutMs")),
+            "click": lambda p: self.click(
+                p["selector"], button=p.get("button", "left"),
+                clickCount=p.get("clickCount", 1), timeoutMs=p.get("timeoutMs"),
+                humanize=p.get("humanize"),
+            ),
+            "double_click": lambda p: self.doubleClick(
+                p["selector"], timeoutMs=p.get("timeoutMs"), humanize=p.get("humanize")
+            ),
+            "right_click": lambda p: self.rightClick(
+                p["selector"], timeoutMs=p.get("timeoutMs"), humanize=p.get("humanize")
+            ),
+            "fill": lambda p: self.fill(
+                p["selector"], p["value"], clearFirst=p.get("clearFirst", True),
+                timeoutMs=p.get("timeoutMs"), humanize=p.get("humanize"),
+            ),
+            "scroll": lambda p: self.scroll(**p),
+            "press_keys": lambda p: self.pressKeys(p["keys"], selector=p.get("selector")),
+            "upload_file": lambda p: self.uploadFile(p["selector"], p["filePaths"]),
+            "wait_for_element": lambda p: self.waitForElement(
+                p["selector"], state=p.get("state", "visible"), timeoutMs=p.get("timeoutMs")
+            ),
+        }
+
+    # ------------------------------------------------------------------ #
+    # Browser memory (a searchable store of pages the agent has seen)
+    # ------------------------------------------------------------------ #
+    async def rememberPage(
+        self, tags: list[str] | None = None, withScreenshot: bool = True, textLimit: int = 2000
+    ) -> dict[str, Any]:
+        """Capture the current page (title/url/structure/screenshot) into memory."""
+        async def op() -> dict[str, Any]:
+            self._requireRunning()
+            title = (await self.controller.getTitle()).get("title")
+            url = (await self.controller.getUrl()).get("url")
+            text = (await self.controller.extractText()).get("text", "")
+            links = await self.controller.extractLinks()
+            buttons = await self.controller.extractButtons()
+            forms = await self.controller.extractForms()
+            shotPath = None
+            if withScreenshot and not self.noImageMode:
+                try:
+                    shotPath = (await self.screenshots.capture(self.controller.activePage)).get("path")
+                except Exception:  # noqa: BLE001 - a screenshot is a nice-to-have here
+                    shotPath = None
+            entry = {
+                "url": url,
+                "title": title,
+                "host": urlsplit(url).netloc if url else None,
+                "summary": text[:textLimit],
+                "linkCount": links.get("count", 0),
+                "buttonCount": buttons.get("count", 0),
+                "formCount": forms.get("count", 0),
+                "screenshot": shotPath,
+                "tags": tags or [],
+            }
+            return getPageMemory().remember(entry)
+
+        return await self._run("remember_page", op)
+
+    async def searchMemory(self, query: str, limit: int = 10) -> dict[str, Any]:
+        """Recall remembered pages matching *query* (keyword ranked)."""
+        return await self._run(
+            "search_memory", lambda: self._async(getPageMemory().search(query, limit))
+        )
+
+    async def listMemory(self, limit: int = 50) -> dict[str, Any]:
+        """List the most recently remembered pages."""
+        return await self._run("list_memory", lambda: self._async(getPageMemory().list(limit)))
+
+    async def clearMemory(self) -> dict[str, Any]:
+        """Forget all remembered pages."""
+        return await self._run("clear_memory", lambda: self._async(getPageMemory().clear()))
+
+    # ------------------------------------------------------------------ #
+    # OCR (read text baked into images / screenshots)
+    # ------------------------------------------------------------------ #
+    async def extractTextFromScreenshot(
+        self, fullPage: bool = False, selector: str | None = None, lang: str = "eng"
+    ) -> dict[str, Any]:
+        """Screenshot the page (or an element) and OCR the text out of the pixels."""
+        async def op() -> dict[str, Any]:
+            self._requireRunning()
+            shot = await self.screenshots.capture(
+                self.controller.activePage, fullPage=fullPage, selector=selector
+            )
+            result = ocr.extractText(shot["path"], lang=lang)
+            if "error" in result:
+                raise ValueError(f"{result['error']}: {result.get('details', '')}")
+            result["screenshot"] = shot["path"]
+            return result
+
+        return await self._run("extract_text_from_screenshot", op)
+
+    async def readImage(self, source: str, lang: str = "eng") -> dict[str, Any]:
+        """OCR an image file on disk (no running browser required)."""
+        async def op() -> dict[str, Any]:
+            result = ocr.extractText(source, lang=lang)
+            if "error" in result:
+                raise ValueError(f"{result['error']}: {result.get('details', '')}")
+            return result
+
+        return await self._run("read_image", op)
+
+    # ------------------------------------------------------------------ #
+    # AI judgment (provider-backed): goal check, element finding, planning
+    # ------------------------------------------------------------------ #
+    async def verifyGoal(self, goal: str, fullPage: bool = False) -> dict[str, Any]:
+        """Look at the current page and judge whether *goal* is visually met."""
+        async def op() -> dict[str, Any]:
+            self._requireRunning()
+            shot = await self.screenshots.captureBytes(self.controller.activePage, fullPage=fullPage)
+            result = intelligence.verifyGoal(goal, shot["image"])
+            if "error" in result:
+                raise ValueError(f"{result['error']}: {result.get('details', '')}")
+            return result
+
+        return await self._run("verify_goal", op)
+
+    async def findElement(self, description: str, limit: int = 60) -> dict[str, Any]:
+        """Find the element best matching a natural-language *description*."""
+        async def op() -> dict[str, Any]:
+            self._requireRunning()
+            cands = (await self.controller.getInteractiveCandidates(limit)).get("candidates", [])
+            result = intelligence.findElement(description, cands)
+            if "error" in result:
+                raise ValueError(f"{result['error']}: {result.get('details', '')}")
+            return result
+
+        return await self._run("find_element", op)
+
+    async def clickByDescription(
+        self, description: str, limit: int = 60, humanize: bool | None = None
+    ) -> dict[str, Any]:
+        """Locate an element by description and click it (find_element + click)."""
+        async def op() -> dict[str, Any]:
+            self._requireRunning()
+            cands = (await self.controller.getInteractiveCandidates(limit)).get("candidates", [])
+            found = intelligence.findElement(description, cands)
+            if "error" in found:
+                raise ValueError(f"{found['error']}: {found.get('details', '')}")
+            selector = found.get("selector")
+            if not found.get("found") or not selector:
+                return {"clicked": False, "description": description,
+                        "reason": found.get("reason"), "confidence": found.get("confidence")}
+            await self.controller.clickElement(selector, humanize=humanize)
+            return {"clicked": True, "selector": selector, "description": description,
+                    "confidence": found.get("confidence"), "reason": found.get("reason")}
+
+        return await self._run("click_by_description", op)
+
+    async def planActions(self, goal: str, includeContext: bool = True) -> dict[str, Any]:
+        """Ask the active AI provider for an ordered action plan to achieve *goal*."""
+        async def op() -> dict[str, Any]:
+            context: dict[str, Any] | None = None
+            if includeContext and self.controller.isRunning:
+                try:
+                    context = {
+                        "url": (await self.controller.getUrl()).get("url"),
+                        "title": (await self.controller.getTitle()).get("title"),
+                        "candidates": (await self.controller.getInteractiveCandidates(30)).get("candidates", []),
+                    }
+                except Exception:  # noqa: BLE001 - context is optional
+                    context = None
+            result = intelligence.planActions(goal, context)
+            if "error" in result:
+                raise ValueError(f"{result['error']}: {result.get('details', '')}")
+            return result
+
+        return await self._run("plan_actions", op)
+
+    # ------------------------------------------------------------------ #
+    # Workflows (named, saved sessions you can re-run by name)
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _workflowPath(name: str) -> Path:
+        safe = re.sub(r"[^a-zA-Z0-9_-]+", "-", name).strip("-") or "workflow"
+        return settings.workflowDir / f"{safe}.json"
+
+    async def saveWorkflow(self, name: str) -> dict[str, Any]:
+        """Save the current recorded session as a named, re-runnable workflow."""
+        def op() -> dict[str, Any]:
+            target = self._workflowPath(name)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            result = self.session.save(str(target))
+            result["workflow"] = target.stem
+            return result
+
+        return await self._run("save_workflow", lambda: self._async(op()))
+
+    async def listWorkflows(self) -> dict[str, Any]:
+        """List saved workflows by name."""
+        def op() -> dict[str, Any]:
+            directory = Path(settings.workflowDir)
+            items = (
+                [{"name": f.stem, "path": str(f)} for f in sorted(directory.glob("*.json"))]
+                if directory.exists()
+                else []
+            )
+            return {"workflows": items, "count": len(items)}
+
+        return await self._run("list_workflows", lambda: self._async(op()))
+
+    async def runWorkflow(
+        self, name: str, delayMs: int = 500, continueOnError: bool = True
+    ) -> dict[str, Any]:
+        """Replay a previously saved workflow by name."""
+        target = self._workflowPath(name)
+        if not target.exists():
+            return buildErrorEnvelope(
+                "run_workflow", FileNotFoundError(f"No workflow named '{name}' ({target})")
+            )
+        return await self.replaySession(
+            path=str(target), delayMs=delayMs, continueOnError=continueOnError
+        )
+
+    # ------------------------------------------------------------------ #
+    # Website Skill System (persistent per-domain operational knowledge)
+    # ------------------------------------------------------------------ #
+    async def discoverPage(self, url: str | None = None) -> dict[str, Any]:
+        """Discover the CURRENT page (or navigate to *url* first) and save its skill."""
+        async def op() -> dict[str, Any]:
+            self._requireRunning()
+            if url:
+                await self.controller.openUrl(url, waitUntil="networkidle")
+            current = (await self.controller.getUrl()).get("url")
+            discovery = await self.discovery.discoverPage(self.controller)
+            saved = (
+                self.skills.saveDiscovery(current, discovery)
+                if self.skills.mode == "LEARN"
+                else {"saved": False, "mode": self.skills.mode}
+            )
+            return {"discovery": discovery, "saved": saved}
+
+        return await self._run("discover_page", op)
+
+    async def discoverWebsite(
+        self, startUrl: str | None = None, maxPages: int = 10
+    ) -> dict[str, Any]:
+        """Crawl internal routes from the current/Start page (depth-bounded) and learn each.
+
+        Runs entirely under one lock and navigates via the controller directly, so
+        it never re-enters :meth:`navigate`. Safe by construction: it only follows
+        GET-like internal links and never submits forms or clicks destructive UI.
+        """
+        async def op() -> dict[str, Any]:
+            self._requireRunning()
+            if startUrl:
+                await self.controller.openUrl(startUrl, waitUntil="networkidle")
+            from app.browser.website_skills import domainOf  # noqa: PLC0415
+            from app.browser.discovery_engine import classifyNavigation, routeOf  # noqa: PLC0415
+
+            start = (await self.controller.getUrl()).get("url")
+            domain = domainOf(start)
+            cap = max(1, min(maxPages, 50))  # ponytail: hard cap; raise if needed
+            seen: set[str] = set()
+            queue: list[str] = [start]
+            learned: list[dict[str, Any]] = []
+            while queue and len(seen) < cap:
+                current = queue.pop(0)
+                route = routeOf(current)
+                if route in seen:
+                    continue
+                seen.add(route)
+                if domainOf(current) != domain:
+                    continue
+                try:
+                    await self.controller.openUrl(current, waitUntil="networkidle")
+                    discovery = await self.discovery.discoverPage(self.controller)
+                    if self.skills.mode == "LEARN":
+                        learned.append(self.skills.saveDiscovery(
+                            (await self.controller.getUrl()).get("url"), discovery))
+                    links = (await self.controller.extractLinks()).get("links", [])
+                    for r in classifyNavigation(links, current)["internalRoutes"]:
+                        nextUrl = f"https://{domain}{r['route']}"
+                        if r["route"] not in seen and len(seen) + len(queue) < cap:
+                            queue.append(nextUrl)
+                except Exception as exc:  # noqa: BLE001 - skip a bad page, keep crawling
+                    logger.warning("discover_website: skipped %s (%s)", current, exc)
+            return {"domain": domain, "pagesVisited": len(seen), "learned": learned,
+                    "mode": self.skills.mode}
+
+        return await self._run("discover_website", op)
+
+    async def updateSkill(
+        self,
+        url: str,
+        success: bool | None = None,
+        confidenceDelta: int | None = None,
+    ) -> dict[str, Any]:
+        """Record an outcome against a route's skill (drives confidence / rediscovery)."""
+        async def op() -> dict[str, Any]:
+            if confidenceDelta is not None:
+                return self.skills.adjustConfidence(url, confidenceDelta)
+            if success is True:
+                return self.skills.recordSuccess(url)
+            if success is False:
+                return self.skills.recordFailure(url)
+            raise ValueError("Provide 'success' (bool) or 'confidenceDelta' (int).")
+
+        return await self._run("update_skill", op)
+
+    async def listSkills(self, domain: str | None = None) -> dict[str, Any]:
+        """List known websites, or one domain's routes + workflows."""
+        return await self._run("list_skills", lambda: self._async(self.skills.listSkills(domain)))
+
+    async def searchSkills(self, query: str, limit: int = 20) -> dict[str, Any]:
+        """Keyword-search learned skills using the JSON indexes (no folder scans)."""
+        return await self._run(
+            "search_skills", lambda: self._async(self.skills.searchSkills(query, limit))
+        )
+
+    async def exportSkills(self, domain: str | None = None, savePath: str | None = None) -> dict[str, Any]:
+        """Export skills (one domain or all) as a portable bundle; optionally to a file."""
+        async def op() -> dict[str, Any]:
+            bundle = self.skills.exportSkills(domain)
+            if savePath:
+                Path(savePath).parent.mkdir(parents=True, exist_ok=True)
+                Path(savePath).write_text(json.dumps(bundle, indent=2), encoding="utf-8")
+                return {"path": savePath, "domains": list(bundle["domains"].keys())}
+            return bundle
+
+        return await self._run("export_skills", op)
+
+    async def importSkills(
+        self, bundle: dict[str, Any] | None = None, path: str | None = None, overwrite: bool = False
+    ) -> dict[str, Any]:
+        """Import a skills bundle (inline dict or from a file)."""
+        async def op() -> dict[str, Any]:
+            data = bundle
+            if data is None:
+                if not path:
+                    raise ValueError("Provide either inline 'bundle' or a 'path' to import.")
+                data = json.loads(Path(path).read_text(encoding="utf-8"))
+            return self.skills.importSkills(data, overwrite=overwrite)
+
+        return await self._run("import_skills", op)
+
+    async def clearSkills(self, domain: str | None = None) -> dict[str, Any]:
+        """Forget one domain's skills, or wipe the whole skill store."""
+        return await self._run("clear_skills", lambda: self._async(self.skills.clearSkills(domain)))
+
+    async def setDiscoveryMode(self, mode: str) -> dict[str, Any]:
+        """Set the Website Skill System mode: OFF, READ_ONLY, or LEARN."""
+        return await self._run("set_discovery_mode", lambda: self._async(self.skills.setMode(mode)))
+
+    async def getDiscoveryStatus(self) -> dict[str, Any]:
+        """Report discovery mode, storage, website count, and thresholds."""
+        return await self._run("get_discovery_status", lambda: self._async(self.skills.status()))
+
+    # ------------------------------------------------------------------ #
     # Status
     # ------------------------------------------------------------------ #
     async def status(self) -> dict[str, Any]:
         async def op() -> dict[str, Any]:
             snapshot = self.controller._stateSnapshot()  # noqa: SLF001 - internal read
+            snapshot["backend"] = self.backendName
             snapshot["recording"] = self.recorder.isRecording
+            snapshot["sessionRecording"] = self.session.recording
+            snapshot["sessionSteps"] = len(self.session.steps)
+            snapshot["activeProfile"] = self.profiles.getActiveProfile()
+            snapshot["noImageMode"] = self.noImageMode
+            snapshot["discoveryMode"] = self.skills.mode
             return snapshot
 
         return await self._run("status", op)
@@ -342,6 +1177,11 @@ class BrowserManager:
     # ------------------------------------------------------------------ #
     # Helpers
     # ------------------------------------------------------------------ #
+    @staticmethod
+    async def _async(data: dict[str, Any]) -> dict[str, Any]:
+        """Wrap a ready value as an awaitable so it can flow through ``_run``."""
+        return data
+
     def _guard(self, coroFactory: Callable[[], Awaitable[dict[str, Any]]]) -> Callable[[], Awaitable[dict[str, Any]]]:
         """Wrap an operation so it first asserts the browser is running."""
 
@@ -353,14 +1193,17 @@ class BrowserManager:
 
 
 # --------------------------------------------------------------------- #
-# Process-wide singleton accessor (future: resolve per-session from a pool)
+# Per-session resolution via the session pool
 # --------------------------------------------------------------------- #
-_managerSingleton: BrowserManager | None = None
-
-
 def getBrowserManager() -> BrowserManager:
-    """Return the shared :class:`BrowserManager`, creating it on first use."""
-    global _managerSingleton
-    if _managerSingleton is None:
-        _managerSingleton = BrowserManager()
-    return _managerSingleton
+    """Return the **active session's** :class:`BrowserManager`.
+
+    Resolution now goes through :class:`~app.browser.session_pool.SessionPool`
+    (lazily importing it to avoid a cycle): with a single session this behaves
+    exactly like the old process-wide singleton, but ``create_session`` /
+    ``switch_session`` let an agent drive several isolated browsers and this
+    returns whichever one is currently active.
+    """
+    from app.browser.session_pool import getSessionPool  # noqa: PLC0415 - avoid cycle
+
+    return getSessionPool().active()

@@ -1,15 +1,35 @@
 # AI Browser Controller
 
-A plug-and-play browser automation layer that lets any AI agent — primarily **Claude** — control a real browser. It can navigate to pages, inspect their UI/UX, take screenshots, record sessions to MP4, and report back **structured JSON** that an agent can reason over. The same browser-control surface is exposed three ways — a FastAPI HTTP + WebSocket server, an MCP stdio server, and in-process AI adapters — so you can drop it into a Claude Desktop config, a custom agent loop, or your own backend without rewriting anything.
+A plug-and-play browser automation layer that lets an AI agent control a real, automatable Chrome browser. It can navigate to pages, inspect their UI/UX, take screenshots, record sessions to MP4, and report back **structured JSON** that an agent can reason over. The same browser-control surface is exposed three ways — a FastAPI HTTP + WebSocket server, an MCP stdio server (for Claude Code/Desktop), and in-process AI adapters — so you can drop it into a Claude Desktop config, a custom agent loop, or your own backend without rewriting anything.
+
+**Who drives it:** Claude over MCP, **or** an in-process LLM that automates the web for you — **Gemini** (default), Claude, or OpenAI — via `python start.py agent "<task>"`. All three share one tool registry, so the browser behaves identically whichever brain is in control.
 
 ## Features
 
 - **Full browser control** — launch/close, navigate (back/forward/refresh), tabs, click/double-click/right-click, hover, fill inputs, scroll, press keys, upload/download files, and waits — backed by Playwright.
+- **Humanized interaction (anti bot-detection)** — on by default: typing is paced (~25 WPM with natural jitter), the mouse travels a curved, wobbling path to a random point inside the target (never a straight teleport to the exact center) and remembers where it was, and scrolling is lazy/incremental like a human discovering the page. Force on/off per call with `humanize`, or globally with `ABC_HUMANIZE`.
+- **Stealth (smaller automation fingerprint)** — on by default (`ABC_STEALTH`): strips the `--enable-automation` switch / "controlled by automated software" banner and patches the common JS tells (`navigator.webdriver`, `window.chrome`, plugins/languages). Humanization covers *behaviour*; stealth covers the *fingerprint*. Best paired with the real-Chrome channel (`ABC_BROWSER_CHANNEL=chrome`). **Caveat:** hardened identity providers (notably **Google sign-in**) may still block automated contexts even so — prefer a less aggressive provider for login tests, or log in to Google manually once in a headed window and rely on the persistent profile thereafter.
+- **Multiple Chrome profiles** — named, isolated profiles (each its own logins/cookies). The chosen profile is **remembered on disk and auto-reopens in later chats**; `open_browser` asks which profile to use (or random) the first time. Tools: `list_profiles`, `select_profile`, `create_profile`, and `login_session` (opens a headed window so a human can log in / sign up, then saves the session for future automated runs).
+- **Event-driven waiting** — wait *quietly* for slow things instead of polling: `wait_for_stable` resolves when an element's text stops changing (perfect for an online AI's streamed answer), and `wait_for_response` resolves when a matching network response finishes streaming. Capped at 5 min by default (`ABC_MAX_WAIT_MS`); downloads get up to ~1h (`ABC_MAX_DOWNLOAD_WAIT_MS`). An SSE `/events` stream pushes progress to HTTP clients.
+- **Safe downloads** — `download_file` keeps **verified real images only** by default: the saved bytes are inspected (magic number + full decode) and anything that is actually an executable/app/archive disguised as an image is deleted and reported as an error.
+- **No-image mode (MarkItDown)** — a global toggle (`set_no_image_mode`) that suppresses pixel screenshots in favour of text, plus a `to_markdown` tool that converts images/PDF/Office/HTML (file or URL) to markdown via Microsoft's MarkItDown.
 - **Visual intelligence / screenshots** — capture the viewport, the full scrollable page, or a single element; optional annotation with a label.
+- **Visual diff engine** — `compare_screenshots(before, after)` quantifies what changed between two captures: `visualDifferencePercent` plus `changedRegions` with bounding boxes (and an optional change-mask PNG). Turns "I took a screenshot" into "I can tell what moved".
+- **Visual QA / page audit** — `audit_page` reports common UI defects with counts + samples: horizontal overflow, hidden interactive elements, broken images, and low text/background contrast (approximate WCAG ratio) — no screenshot needed.
+- **Accessibility tree** — `get_accessibility_tree` returns the roles/names a screen reader sees, often clearer than raw HTML for understanding page structure.
+- **Tab intelligence** — `get_tabs` summarises every open tab (index, title, URL, host, which is active) so a multi-tab agent never loses track.
+- **Browser-state snapshots** — `create_snapshot` / `restore_snapshot` save and restore cookies + localStorage + sessionStorage + open-tab URLs to JSON, so a session can be resumed without re-logging-in and re-navigating.
+- **Session replay (structured action log)** — distinct from video: `start_session` records every replayable action (click/fill/navigate/...) as JSON steps; `save_session` / `load_session` / `replay_session` reproduce a bug, build a workflow, or audit what was done.
+- **Named workflows** — `save_workflow` / `run_workflow` / `list_workflows` save a recorded session under a name and replay it later by name — no AI needed, fast and deterministic.
+- **AI judgment (provider follows the driver)** — turns automation into *self-correcting* automation: `verify_goal` looks at a screenshot and judges whether a plain-language goal is met (`{success, confidence, reason}`); `find_element` / `click_by_description` locate an element from a description like "blue login button"; `plan_actions` returns an inspectable step plan. These reason with **whoever is driving** — a Gemini-driven run judges with Gemini, a Claude/Claude-Code run judges with Claude, OpenAI with OpenAI (set explicitly via `ABC_AI_PROVIDER`). Degrades to a clear "unavailable" error when that provider's SDK/key is absent.
+- **Browser memory** — `remember_page` stores a page's title/URL/structure/screenshot; `search_memory` recalls it later by keyword so the agent avoids re-scraping pages it has already seen.
+- **Website Skill System (persistent operational knowledge)** — the browser permanently *learns how each site works* and reuses it on future visits. On navigation it reads `website_skills/websites.json` → the domain's `index.json` → only the matching route markdown (O(1) lookup, never a folder scan); if the route is new or low-confidence it auto-runs a safe, staged discovery (static → navigation → interaction-detect → workflow inference) and saves a route skill. Knowledge is **merged and versioned, never overwritten**; per-route confidence rises on success and falls on failure, triggering automatic rediscovery below a threshold. Discovery is non-destructive (never clicks delete/pay/logout). Modes: `OFF` / `READ_ONLY` / `LEARN` (default, enabled by default but fully optional). Tools: `discover_page`, `discover_website`, `update_skill`, `list_skills`, `search_skills`, `export_skills`, `import_skills`, `clear_skills`, `set_discovery_mode`, `get_discovery_status`. Distinct from browser memory: memory stores *what a page was*, skills store *how a site works*.
+- **OCR** — `extract_text_from_screenshot` / `read_image` read text baked into images/canvas via Tesseract (optional dependency; honest error with install hints when absent).
+- **Browser session pool** — `create_session` / `list_sessions` / `switch_session` / `close_session` run several isolated browsers (own cookies/tabs/state) with one active at a time; every other tool drives the active session.
 - **Screen recording to MP4** — record a browser session and finalize it to a video file (ffmpeg-backed).
-- **MCP server** — every action is published as an MCP tool over stdio, so Claude Desktop (and any MCP client) can drive the browser directly.
+- **MCP server** — every action is published as an MCP tool over stdio, so Claude Desktop/Code (and any MCP client) can drive the browser directly.
 - **FastAPI + WebSocket** — a REST surface plus a persistent `/ws` socket that speaks the same action vocabulary.
-- **Claude & OpenAI adapters** — in-process adapters that map the browser actions to provider tool-calling so an agent can run an autonomous loop.
+- **Gemini / Claude / OpenAI adapters** — in-process adapters that map the browser actions to each provider's tool-calling so the LLM runs an autonomous loop. They all share one tool registry; run one with `python start.py agent --provider {gemini,claude,openai} "<task>"`.
 - **AI-friendly structured JSON** — every action, on every transport, returns the same success/error envelope so agents see one consistent contract.
 
 ## Architecture
@@ -22,7 +42,7 @@ ai-browser-controller/
 │   ├── agents/       # Claude & OpenAI adapters that map tools -> BrowserManager
 │   ├── mcp/          # MCP stdio server exposing every action as a tool
 │   ├── models/       # Pydantic command/response models (request + envelope shapes)
-│   ├── storage/      # Saved artifacts: screenshots/, recordings/ (gitkept, contents ignored)
+│   ├── storage/      # Artifacts: screenshots/ recordings/ sessions/ snapshots/ diffs/ workflows/ memory/ (contents ignored)
 │   └── utils/        # config (settings), logger, and shared helpers (response envelopes)
 ├── tests/            # pytest suite (browser tests auto-skip without Playwright browsers)
 ├── start.py          # CLI entrypoint: `api` | `mcp` | `info`
@@ -36,10 +56,22 @@ Module map:
 
 | Module | Responsibility |
 | --- | --- |
-| `app/browser/playwright_controller.py` | Thin async wrapper over Playwright (launch, navigate, interact, extract). |
+| `app/browser/playwright_controller.py` | Thin async wrapper over Playwright (launch, navigate, interact, extract). Routes typing/clicking/scrolling through the humanizer and tracks cursor position. |
+| `app/browser/humanize.py` | Human-like primitives: paced typing, curved/jittered mouse travel, lazy scroll. |
+| `app/browser/stealth.py` | Anti-detection launch flags + JS init script that shrink the automation fingerprint. |
+| `app/browser/profiles.py` | `ProfileManager` — named profiles under `storage/profiles/` and the persisted active-profile pointer (`getProfileManager()` singleton). |
+| `app/browser/media.py` | `verifyImage` (download safety) and `toMarkdown` (MarkItDown, no-image mode). |
 | `app/browser/screenshot_manager.py` | Capture and save screenshots (viewport / full page / element / annotated). |
 | `app/browser/video_recorder.py` | Start/stop session recording and finalize the MP4 (ffmpeg). |
-| `app/browser/browser_manager.py` | **Facade** the API, MCP, and adapters all call. Wraps every action in the AI-friendly envelope and serializes access behind an `asyncio.Lock`. Exposes `getBrowserManager()` singleton. |
+| `app/browser/session_recorder.py` | `SessionRecorder` — structured, replayable action log (save/load/replay). |
+| `app/browser/visual_diff.py` | Pixel diff of two screenshots (% changed + changed regions). |
+| `app/browser/page_memory.py` | `PageMemory` — searchable store of pages the agent has seen (`getPageMemory()`). |
+| `app/browser/website_skills.py` | `WebsiteSkillManager` — persistent per-domain operational knowledge (JSON indexes + versioned route markdown, modes, confidence) (`getWebsiteSkillManager()`). |
+| `app/browser/discovery_engine.py` | `DiscoveryEngine` — safe, staged, non-destructive page discovery → structured route skill (heuristic, browser-free testable). |
+| `app/browser/ocr.py` | Optional Tesseract OCR for text inside images/screenshots (graceful when absent). |
+| `app/browser/intelligence.py` | Claude-backed goal verification / element finding / planning (graceful when absent). |
+| `app/browser/session_pool.py` | `SessionPool` — many isolated browsers, one active; backs `getBrowserManager()`. |
+| `app/browser/browser_manager.py` | **Facade** the API, MCP, and adapters all call. Wraps every action in the AI-friendly envelope and serializes access behind an `asyncio.Lock`. `getBrowserManager()` resolves the active session from the pool. |
 | `app/api/server.py` | FastAPI app + REST routes; exposes `app` and `runServer()`. |
 | `app/api/websocket.py` | `/ws` WebSocket route speaking `{"action", "params"}`. |
 | `app/agents/claude_adapter.py` | `ClaudeAdapter` — builds tools and runs a Claude conversation loop. |
@@ -61,7 +93,7 @@ So a method named `takeScreenshot` (camelCase, internal) backs the MCP tool `tak
 
 ## Requirements / Prerequisites
 
-- **Python 3.12+**
+- **Python 3.11+**
 - **ffmpeg** — a **system** dependency (not a pip package). Required for recording / MP4 encoding. Install it and make sure it is on your `PATH`:
   - macOS: `brew install ffmpeg`
   - Debian/Ubuntu: `sudo apt install ffmpeg`
@@ -78,7 +110,7 @@ Everything is open-source and free, and is meant to be installed **only inside a
 
 ```bash
 # 1. Create and activate a virtualenv
-python3.12 -m venv venv
+python3.11 -m venv venv          # any Python >= 3.11
 source venv/bin/activate        # macOS/Linux
 venv\Scripts\activate           # Windows (PowerShell/cmd)
 
@@ -231,13 +263,33 @@ Register it with Claude Desktop by adding an entry to `claude_desktop_config.jso
 
 Exposed MCP tools (snake_case, the external contract):
 
-`open_browser`, `close_browser`, `navigate`, `navigate_back`, `navigate_forward`,
-`refresh`, `open_new_tab`, `switch_tab`, `close_tab`, `get_title`, `get_url`,
-`extract_text`, `extract_links`, `extract_buttons`, `extract_forms`,
-`extract_images`, `get_dom`, `scroll`, `hover`, `click`, `double_click`,
-`right_click`, `fill`, `upload_file`, `download_file`, `press_keys`,
-`wait_for_element`, `wait_for_network_idle`, `take_screenshot`,
-`start_recording`, `stop_recording`, `status`.
+- **Lifecycle / profiles:** `open_browser`, `close_browser`, `set_headless`,
+  `clear_profile`, `list_profiles`, `select_profile`, `create_profile`,
+  `login_session`.
+- **Navigation / tabs:** `navigate`, `navigate_back`, `navigate_forward`,
+  `refresh`, `open_new_tab`, `switch_tab`, `close_tab`, `get_tabs`.
+- **Extraction / read:** `get_title`, `get_url`, `extract_text`, `extract_links`,
+  `extract_buttons`, `extract_forms`, `extract_images`, `get_dom`, `read_page`,
+  `get_accessibility_tree`, `get_network`, `clear_network`.
+- **Interaction:** `scroll`, `hover`, `click`, `double_click`, `right_click`,
+  `fill`, `upload_file`, `download_file`, `press_keys`.
+- **Waits:** `wait_for_element`, `wait_for_network_idle`, `wait_for_stable`,
+  `wait_for_response`.
+- **Visual:** `screenshot`, `take_screenshot`, `compare_screenshots`,
+  `audit_page`, `to_markdown`, `set_no_image_mode`.
+- **AI judgment (Claude):** `verify_goal`, `find_element`,
+  `click_by_description`, `plan_actions`.
+- **OCR:** `extract_text_from_screenshot`, `read_image`.
+- **Memory:** `remember_page`, `search_memory`, `list_memory`, `clear_memory`.
+- **Website skills:** `discover_page`, `discover_website`, `update_skill`,
+  `list_skills`, `search_skills`, `export_skills`, `import_skills`,
+  `clear_skills`, `set_discovery_mode`, `get_discovery_status`.
+- **State / sessions:** `create_snapshot`, `restore_snapshot`, `start_session`,
+  `stop_session`, `save_session`, `load_session`, `replay_session`,
+  `save_workflow`, `run_workflow`, `list_workflows`,
+  `start_recording`, `stop_recording`, `clear_storage`, `status`.
+- **Browser pool:** `create_session`, `list_sessions`, `switch_session`,
+  `close_session`.
 
 ### Claude adapter
 
@@ -291,15 +343,35 @@ All runtime settings are resolved once at import time from `ABC_*` environment v
 | `ABC_HOST` | `apiHost` | `127.0.0.1` | Host/interface the FastAPI server binds to. |
 | `ABC_PORT` | `apiPort` | `8000` | Port the FastAPI server listens on. |
 | `ABC_BROWSER` | `browserType` | `chromium` | Browser engine: `chromium` \| `firefox` \| `webkit`. |
+| `ABC_BROWSER_CHANNEL` | `browserChannel` | _(bundled)_ | Real-browser channel, e.g. `chrome`, `msedge` (harder to bot-detect). |
 | `ABC_HEADLESS` | `headless` | `true` | Run without a visible window. |
 | `ABC_VIEWPORT_WIDTH` | `viewportWidth` | `1280` | Viewport width in pixels. |
 | `ABC_VIEWPORT_HEIGHT` | `viewportHeight` | `800` | Viewport height in pixels. |
 | `ABC_TIMEOUT_MS` | `defaultTimeoutMs` | `30000` | Default action/navigation timeout (ms). |
 | `ABC_USER_AGENT` | `userAgent` | _(browser default)_ | Optional custom User-Agent. |
+| `ABC_HUMANIZE` | `humanize` | `true` | Human-like typing/clicking/scrolling (anti bot-detection). |
+| `ABC_TYPING_WPM` | `typingWpm` | `25` | Typing speed in words/min (with jitter). |
+| `ABC_STEALTH` | `stealth` | `true` | Reduce the automation fingerprint (webdriver flag, automation switches). |
+| `ABC_MAX_WAIT_MS` | `maxWaitMs` | `300000` | Ceiling for quiet/event-driven waits (5 min). |
+| `ABC_MAX_DOWNLOAD_WAIT_MS` | `maxDownloadWaitMs` | `3600000` | Ceiling for downloads (1 h). |
+| `ABC_NO_IMAGE_MODE` | `noImageMode` | `false` | Start in no-image mode (markdown over pixels). |
 | `ABC_RECORDING_FPS` | `recordingFps` | `24` | Frames per second for recordings. |
 | `ABC_FFMPEG` | `ffmpegBinary` | `ffmpeg` | Path to the ffmpeg binary (system dependency). |
 | `ABC_SCREENSHOT_DIR` | `screenshotDir` | `app/storage/screenshots` | Where screenshots are saved. |
 | `ABC_RECORDING_DIR` | `recordingDir` | `app/storage/recordings` | Where recordings are saved. |
+| `ABC_SESSION_DIR` | `sessionDir` | `app/storage/sessions` | Where replayable session logs are saved. |
+| `ABC_SNAPSHOT_DIR` | `snapshotDir` | `app/storage/snapshots` | Where browser-state snapshots are saved. |
+| `ABC_DIFF_DIR` | `diffDir` | `app/storage/diffs` | Where visual-diff masks are saved. |
+| `ABC_MEMORY_DIR` / `ABC_MEMORY_FILE` | `memoryDir` / `memoryFile` | `app/storage/memory` | Browser-memory store location. |
+| `ABC_WORKFLOW_DIR` | `workflowDir` | `app/storage/workflows` | Where named workflows are saved. |
+| `ABC_DISCOVERY_MODE` | `discoveryMode` | `LEARN` | Website Skill System mode: `OFF` \| `READ_ONLY` \| `LEARN`. |
+| `ABC_DISCOVERY_STORAGE` | `discoveryStorage` | `app/storage/website_skills` | Root holding per-domain learned skills + `websites.json`. |
+| `ABC_DISCOVERY_CONFIDENCE_THRESHOLD` | `discoveryConfidenceThreshold` | `50` | Confidence floor below which a known route auto-rediscovers. |
+| `ABC_DISCOVERY_AUTO_UPDATE` | `discoveryAutoUpdate` | `true` | Auto-discover/relearn on navigation (LEARN mode only). |
+| `ABC_DISCOVERY_MAX_DEPTH` | `discoveryMaxDepth` | `2` | Max crawl depth for whole-site discovery. |
+| `ABC_AI_MODEL` | `aiModel` | `claude-opus-4-8` | Claude model for verify_goal / find_element / plan_actions. |
+| `ABC_PROFILES_DIR` | `profilesDir` | `app/storage/profiles` | Root for named browser profiles. |
+| `ABC_ACTIVE_PROFILE_FILE` | `activeProfileFile` | `app/storage/active_profile.json` | Persisted active-profile pointer. |
 | `ABC_LOG_LEVEL` | `logLevel` | `INFO` | Log verbosity: `DEBUG` … `CRITICAL`. |
 
 Run `python start.py info` to print the resolved settings and storage paths.
@@ -308,11 +380,12 @@ Run `python start.py info` to print the resolved settings and storage paths.
 
 The `BrowserManager` facade plus the `getBrowserManager()` singleton are the deliberate **seam** for scaling out — today it returns one process-wide manager, but a `BrowserPool` keyed by session id could resolve a manager per session without changing any caller. That single seam opens the door to:
 
-- **Multi-browser sessions** and **browser pools** (concurrent, isolated sessions).
 - **Autonomous agents** running long task loops via the adapters.
-- **Visual QA**, **accessibility audits**, and **UI regression** testing built on the screenshot/extraction primitives.
 - **Human-in-the-loop** approvals between agent steps.
 - **Remote / distributed execution** of the browser layer behind the same API.
+- **True concurrent sessions** — the pool runs many isolated browsers but drives one *active* at a time; per-session parallel execution (rather than switch-then-act) is the next step.
+
+> Already built (see Features): **browser session pool** (`create_session`/`switch_session`), **AI judgment** (`verify_goal`, `find_element`, `plan_actions`), **browser memory**, **OCR**, **named workflows**, **visual QA / accessibility audits** (`audit_page`, `get_accessibility_tree`), **UI regression** via `compare_screenshots`, and **session replay** via `start_session` / `replay_session`.
 
 ## License
 

@@ -32,11 +32,24 @@ htmlcov/
 app/storage/screenshots/*
 app/storage/recordings/*
 app/storage/downloads/
+app/storage/sessions/*
+app/storage/snapshots/*
+app/storage/diffs/*
+app/storage/memory/*
+app/storage/workflows/*
+app/storage/website_skills/*
 !app/storage/screenshots/.gitkeep
 !app/storage/recordings/.gitkeep
+!app/storage/sessions/.gitkeep
+!app/storage/diffs/.gitkeep
+!app/storage/workflows/.gitkeep
+!app/storage/website_skills/.gitkeep
 
-# --- Persistent browser profile: cookies/tokens/logins — NEVER commit -------
+# --- Persistent browser profile(s): cookies/tokens/logins — NEVER commit ----
 app/storage/browser_profile/
+# Named multi-profiles and the active-profile pointer (all hold session data).
+app/storage/profiles/
+app/storage/active_profile.json
 
 # --- Generated captures / reports at the project root ----------------------
 # Screenshots, videos, and JSON dumps produced by runs or demo scripts.
@@ -60,6 +73,7 @@ TASKS.md
 NOTES.md
 TODO.md
 SCRATCH.md
+CLAUDE.md
 *.local.md
 
 # --- Logs ------------------------------------------------------------------
