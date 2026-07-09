@@ -15,11 +15,12 @@
   header h1 { margin: 0; font-size: 16px; font-weight: 600; }
   header small { color: #8a93a6; }
   .row { display: flex; gap: 8px; padding: 12px 18px; }
-  input[type=text] {
+  input[type=text], input[type=number] {
     flex: 1; padding: 10px 12px; border-radius: 8px; border: 1px solid #2c3140;
     background: #161a22; color: #e6e6e6; font-size: 14px;
   }
-  input[type=text]:disabled { opacity: .5; }
+  input[type=text]:disabled, input[type=number]:disabled { opacity: .5; }
+  input[type=number] { flex: none; width: 90px; }
   button {
     padding: 10px 16px; border-radius: 8px; border: 0; font-size: 14px; font-weight: 600;
     background: #3b82f6; color: #fff; cursor: pointer;
@@ -45,6 +46,7 @@
 
   <div class="row">
     <input id="task" type="text" placeholder="e.g. ask chatgpt to generate a scenery and download the image" />
+    <input id="maxTurns" type="number" min="1" value="100000" title="Safety cap on steps — default is high enough not to bind for normal tasks" />
     <button id="run">Run</button>
   </div>
 
@@ -59,7 +61,7 @@
 <script>
 (function () {
   const $ = (id) => document.getElementById(id);
-  const log = $("log"), taskInput = $("task"), runBtn = $("run");
+  const log = $("log"), taskInput = $("task"), runBtn = $("run"), maxTurnsInput = $("maxTurns");
   const fbInput = $("feedback"), sendBtn = $("send"), conn = $("conn");
   let running = false;
 
@@ -106,7 +108,8 @@
     if (!task || running || ws.readyState !== WebSocket.OPEN) return;
     log.innerHTML = "";            // fresh log per task (matches per-task context isolation)
     setRunning(true);
-    ws.send(JSON.stringify({ type: "start", task }));
+    const maxTurns = parseInt(maxTurnsInput.value, 10);
+    ws.send(JSON.stringify({ type: "start", task, maxTurns: maxTurns > 0 ? maxTurns : undefined }));
   }
   function sendFeedback() {
     const text = fbInput.value.trim();

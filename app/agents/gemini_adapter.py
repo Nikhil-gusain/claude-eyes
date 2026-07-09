@@ -51,6 +51,13 @@ DEFAULT_GEMINI_MODELS = [
 # Kept for backward compatibility (imports / tests): the head of the chain.
 DEFAULT_GEMINI_MODEL = DEFAULT_GEMINI_MODELS[0]
 
+# Every this-many turns, collapse the conversation history into a single
+# running summary (see GeminiAdapter._compactHistory). Without this, `contents`
+# grows every turn forever and a task with thousands of steps would eventually
+# exceed the model's context window. ponytail: fixed interval, tune if a task's
+# per-turn payloads are unusually large/small.
+COMPACT_EVERY_TURNS = 40
+
 
 def _isOverloaded(exc: BaseException) -> bool:
     """True for transient server-side unavailability (503), matched on text.
@@ -219,10 +226,65 @@ class GeminiAdapter:
             f"All Gemini models are unavailable (503): {self.models[self._modelIndex:]}"
         ) from last
 
+    async def _compactHistory(
+        self,
+        genai: Any,
+        types: Any,
+        userPrompt: str,
+        contents: list[Any],
+        turns: int,
+    ) -> str:
+        """Collapse ``contents`` down to the original task + a running summary.
+
+        Called every :data:`COMPACT_EVERY_TURNS` turns so the tokens resent to
+        Gemini on every subsequent turn stay roughly constant instead of growing
+        with the total run length. Uses a tool-free config so the model can't
+        call functions and must answer in plain text; the reply becomes the new
+        history. Everything is folded into a single ``user`` content (rather
+        than appended as a second one) to avoid relying on undocumented
+        role-alternation tolerance in the API for a run that may last days.
+
+        Mutates ``contents`` in place and returns the summary text (for the
+        caller to surface as a UI event).
+        """
+        summaryConfig = types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT, temperature=0.0)
+        ask = contents + [
+            types.Content(
+                role="user",
+                parts=[types.Part(text=(
+                    f"[System] You've taken {turns} steps. Before continuing, write a "
+                    "concise running summary covering: every concrete finding or result "
+                    "you've gathered so far that you'll still need later (numbers, URLs, "
+                    "causes, scores — do not omit data), and what's left to do. This "
+                    "summary will replace the detailed step history to save context, so "
+                    "it must be self-contained."
+                ))],
+            )
+        ]
+        response = await self._generate(genai, ask, summaryConfig)
+        candidate = response.candidates[0] if response.candidates else None
+        summaryText = (
+            "".join(part.text for part in (candidate.content.parts or []) if getattr(part, "text", None))
+            if candidate and candidate.content
+            else "(model produced no summary text)"
+        )
+        contents[:] = [
+            types.Content(
+                role="user",
+                parts=[types.Part(text=(
+                    f"{userPrompt}\n\n"
+                    f"[Progress summary after {turns} steps — detailed step-by-step "
+                    f"history before this point has been compacted to save context]\n"
+                    f"{summaryText}"
+                ))],
+            )
+        ]
+        return summaryText
+
     async def runConversation(
         self,
         userPrompt: str,
-        maxTurns: int = 12,
+        maxTurns: int = 100_000,
         onEvent: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
         feedback: "asyncio.Queue[str] | None" = None,
     ) -> dict[str, Any]:
@@ -344,6 +406,14 @@ class GeminiAdapter:
                         types.Part.from_function_response(name=call.name, response=payload)
                     )
                 contents.append(types.Content(role="user", parts=responseParts))
+
+                # Bound context growth for very long (thousands-of-turns) runs.
+                if turns % COMPACT_EVERY_TURNS == 0 and turns < maxTurns:
+                    summaryText = await self._compactHistory(genai, types, userPrompt, contents, turns)
+                    await emit({
+                        "type": "status",
+                        "text": f"[Checkpoint @ turn {turns}] compacted history to save context — {summaryText}",
+                    })
         except Exception as exc:  # noqa: BLE001 - surface to the UI, then re-raise
             await emit({"type": "error", "text": str(exc)})
             raise

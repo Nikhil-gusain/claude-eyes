@@ -27,7 +27,7 @@ uvicorn[standard]>=0.29  # ASGI server (standard extras: websockets, httptools, 
 websockets>=12.0         # WebSocket client/server protocol
 
 # ----- vision -----
-opencv-python>=4.9       # frame processing / video assembly helpers
+# opencv-python>=4.9       # frame processing / video assembly helpers
 pillow>=10.2             # image loading, annotation, resizing
 numpy>=1.26              # array math backing the vision pipeline
 

@@ -68,9 +68,7 @@ from app.models.commands import (
     RunWorkflowCommand,
     ScreenshotCommand,
     ScrollCommand,
-<<<<<<< HEAD
     SelectCommand,
-=======
     SessionCreateCommand,
     SessionLoadCommand,
     SessionSaveCommand,
@@ -79,7 +77,6 @@ from app.models.commands import (
     SkillSearchCommand,
     SnapshotCreateCommand,
     SnapshotRestoreCommand,
->>>>>>> 665617f32f25ac1bd204cbe7f946b09026ed9d28
     TabCommand,
     UpdateSkillCommand,
     UploadCommand,
