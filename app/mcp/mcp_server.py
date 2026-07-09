@@ -17,9 +17,10 @@ runs the server over stdio for use as a standalone MCP server process.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Annotated, Any
 
 from mcp.server.fastmcp import FastMCP, Image
+from pydantic import Field
 
 from app.browser.browser_manager import getBrowserManager
 from app.browser.session_pool import (
@@ -35,6 +36,16 @@ from app.utils.logger import getLogger
 logger = getLogger("mcp.server")
 
 mcp = FastMCP("ai-browser-controller")
+
+# Optional per-call tab selector shared by every tab-addressable tool. The value
+# (a handle or friendly name from open_new_tab / get_tabs) is picked up by
+# ``safeAsync`` and scopes the whole call to that tab — this is what lets many
+# sub-agents drive different tabs in parallel. Omit it to use the active tab.
+TabArg = Annotated[
+    str | None,
+    Field(description="Tab handle or friendly name (from open_new_tab / get_tabs) to act on. "
+                      "Omit to use the active tab."),
+]
 
 
 # --------------------------------------------------------------------- #
@@ -227,6 +238,7 @@ async def navigate(
     url: str,
     waitUntil: str = "networkidle",
     timeoutMs: int | None = None,
+    tab: TabArg = None,
 ) -> dict[str, Any]:
     """Navigate the active tab to ``url`` (auto-launches the browser if needed).
 
@@ -243,21 +255,21 @@ async def navigate(
 
 @mcp.tool(name="navigate_back")
 @safeAsync(action="navigate_back")
-async def navigateBack() -> dict[str, Any]:
+async def navigateBack(tab: TabArg = None) -> dict[str, Any]:
     """Go back one entry in the active tab's history (browser Back button)."""
     return await getBrowserManager().navigateBack()
 
 
 @mcp.tool(name="navigate_forward")
 @safeAsync(action="navigate_forward")
-async def navigateForward() -> dict[str, Any]:
+async def navigateForward(tab: TabArg = None) -> dict[str, Any]:
     """Go forward one entry in the active tab's history (browser Forward button)."""
     return await getBrowserManager().navigateForward()
 
 
 @mcp.tool(name="refresh")
 @safeAsync(action="refresh")
-async def refresh() -> dict[str, Any]:
+async def refresh(tab: TabArg = None) -> dict[str, Any]:
     """Reload the current page in the active tab."""
     return await getBrowserManager().refresh()
 
@@ -267,14 +279,19 @@ async def refresh() -> dict[str, Any]:
 # --------------------------------------------------------------------- #
 @mcp.tool(name="open_new_tab")
 @safeAsync(action="open_new_tab")
-async def openNewTab(url: str | None = None) -> dict[str, Any]:
-    """Open a new browser tab and make it active.
+async def openNewTab(url: str | None = None, makeActive: bool = True) -> dict[str, Any]:
+    """Open a new browser tab; returns its ``tab`` handle (uuid) + friendly name.
+
+    Use the returned ``tab`` handle with any tab-addressable tool (navigate,
+    click, read_page, screenshot, get_network, …) to drive this tab specifically
+    — e.g. hand one handle to each sub-agent so they work in parallel.
 
     Args:
-        url: Optional URL to load in the new tab. If omitted, an empty tab is
-            opened.
+        url: Optional URL to load in the new tab. If omitted, an empty tab is opened.
+        makeActive: ``True`` (default) makes it the active tab. Pass ``False`` to
+            open a tab for a sub-agent WITHOUT disturbing the main agent's active tab.
     """
-    return await getBrowserManager().openNewTab(url)
+    return await getBrowserManager().openNewTab(url, makeActive=makeActive)
 
 
 @mcp.tool(name="switch_tab")
@@ -290,7 +307,7 @@ async def switchTab(index: int = 0) -> dict[str, Any]:
 
 @mcp.tool(name="close_tab")
 @safeAsync(action="close_tab")
-async def closeTab(index: int | None = None) -> dict[str, Any]:
+async def closeTab(index: int | None = None, tab: TabArg = None) -> dict[str, Any]:
     """Close a tab by ``index``, or the active tab when ``index`` is omitted.
 
     Args:
@@ -305,21 +322,21 @@ async def closeTab(index: int | None = None) -> dict[str, Any]:
 # --------------------------------------------------------------------- #
 @mcp.tool(name="get_title")
 @safeAsync(action="get_title")
-async def getTitle() -> dict[str, Any]:
+async def getTitle(tab: TabArg = None) -> dict[str, Any]:
     """Return the title of the page in the active tab."""
     return await getBrowserManager().getTitle()
 
 
 @mcp.tool(name="get_url")
 @safeAsync(action="get_url")
-async def getUrl() -> dict[str, Any]:
+async def getUrl(tab: TabArg = None) -> dict[str, Any]:
     """Return the current URL of the active tab."""
     return await getBrowserManager().getUrl()
 
 
 @mcp.tool(name="extract_text")
 @safeAsync(action="extract_text")
-async def extractText() -> dict[str, Any]:
+async def extractText(tab: TabArg = None) -> dict[str, Any]:
     """Extract the visible text content of the current page.
 
     Useful for reading and summarising page content without screenshots.
@@ -329,14 +346,14 @@ async def extractText() -> dict[str, Any]:
 
 @mcp.tool(name="extract_links")
 @safeAsync(action="extract_links")
-async def extractLinks() -> dict[str, Any]:
+async def extractLinks(tab: TabArg = None) -> dict[str, Any]:
     """Extract all hyperlinks (anchor text and href) from the current page."""
     return await getBrowserManager().extractLinks()
 
 
 @mcp.tool(name="extract_buttons")
 @safeAsync(action="extract_buttons")
-async def extractButtons() -> dict[str, Any]:
+async def extractButtons(tab: TabArg = None) -> dict[str, Any]:
     """Extract clickable buttons from the current page.
 
     Returns labels and selectors you can pass to ``click`` to act on them.
@@ -346,7 +363,7 @@ async def extractButtons() -> dict[str, Any]:
 
 @mcp.tool(name="extract_forms")
 @safeAsync(action="extract_forms")
-async def extractForms() -> dict[str, Any]:
+async def extractForms(tab: TabArg = None) -> dict[str, Any]:
     """Extract forms and their input fields from the current page.
 
     Use the returned field selectors with ``fill`` to populate a form.
@@ -356,14 +373,14 @@ async def extractForms() -> dict[str, Any]:
 
 @mcp.tool(name="extract_images")
 @safeAsync(action="extract_images")
-async def extractImages() -> dict[str, Any]:
+async def extractImages(tab: TabArg = None) -> dict[str, Any]:
     """Extract images (source URL and alt text) from the current page."""
     return await getBrowserManager().extractImages()
 
 
 @mcp.tool(name="get_dom")
 @safeAsync(action="get_dom")
-async def getDom(selector: str | None = None) -> dict[str, Any]:
+async def getDom(selector: str | None = None, tab: TabArg = None) -> dict[str, Any]:
     """Return the HTML/DOM of the page, or of a single matched element.
 
     Args:
@@ -375,7 +392,7 @@ async def getDom(selector: str | None = None) -> dict[str, Any]:
 
 @mcp.tool(name="read_page")
 @safeAsync(action="read_page")
-async def readPage(textLimit: int = 5000) -> dict[str, Any]:
+async def readPage(textLimit: int = 5000, tab: TabArg = None) -> dict[str, Any]:
     """Read the whole page in ONE call: title, URL, visible text, links, buttons,
     forms, and image count.
 
@@ -393,19 +410,21 @@ async def readPage(textLimit: int = 5000) -> dict[str, Any]:
 # --------------------------------------------------------------------- #
 @mcp.tool(name="get_network")
 @safeAsync(action="get_network")
-async def getNetwork(limit: int = 100, urlContains: str | None = None) -> dict[str, Any]:
-    """Return the network requests/responses the browser has made.
+async def getNetwork(limit: int = 100, urlContains: str | None = None,
+                     allTabs: bool = False, tab: TabArg = None) -> dict[str, Any]:
+    """Return the network requests/responses for a tab (URL, method, status, type).
 
-    Captures every request across all tabs (URL, HTTP method, status code,
-    resource type, and whether it succeeded). Use this to inspect the API calls,
-    XHR/fetch traffic, and assets a page loads.
+    Scoped to one tab so parallel callers see only their own traffic: defaults to
+    the ``tab`` you pass (or the active tab). Pass ``allTabs=True`` for the whole
+    browser context.
 
     Args:
         limit: Maximum number of most-recent entries to return (default 100).
         urlContains: Optional substring filter — only entries whose URL contains
             this string are returned (e.g. ``"/api/"``).
+        allTabs: ``True`` returns traffic from every tab, not just this one.
     """
-    return await getBrowserManager().getNetwork(limit=limit, urlContains=urlContains)
+    return await getBrowserManager().getNetwork(limit=limit, urlContains=urlContains, allTabs=allTabs)
 
 
 @mcp.tool(name="clear_network")
@@ -428,6 +447,7 @@ async def scroll(
     toTop: bool = False,
     toBottom: bool = False,
     humanize: bool | None = None,
+    tab: TabArg = None,
 ) -> dict[str, Any]:
     """Scroll the page or a scrollable element (human-like by default).
 
@@ -457,7 +477,7 @@ async def scroll(
 
 @mcp.tool(name="hover")
 @safeAsync(action="hover")
-async def hover(selector: str, timeoutMs: int | None = None) -> dict[str, Any]:
+async def hover(selector: str, timeoutMs: int | None = None, tab: TabArg = None) -> dict[str, Any]:
     """Move the mouse over the element matched by ``selector``.
 
     Args:
@@ -476,6 +496,7 @@ async def click(
     clickCount: int = 1,
     timeoutMs: int | None = None,
     humanize: bool | None = None,
+    tab: TabArg = None,
 ) -> dict[str, Any]:
     """Click the element matched by ``selector`` (human-like cursor by default).
 
@@ -500,7 +521,8 @@ async def click(
 @mcp.tool(name="double_click")
 @safeAsync(action="double_click")
 async def doubleClick(
-    selector: str, timeoutMs: int | None = None, humanize: bool | None = None
+    selector: str, timeoutMs: int | None = None, humanize: bool | None = None,
+    tab: TabArg = None,
 ) -> dict[str, Any]:
     """Double-click the element matched by ``selector`` (human-like by default).
 
@@ -517,7 +539,8 @@ async def doubleClick(
 @mcp.tool(name="right_click")
 @safeAsync(action="right_click")
 async def rightClick(
-    selector: str, timeoutMs: int | None = None, humanize: bool | None = None
+    selector: str, timeoutMs: int | None = None, humanize: bool | None = None,
+    tab: TabArg = None,
 ) -> dict[str, Any]:
     """Right-click (context-menu click) the element matched by ``selector``.
 
@@ -539,6 +562,7 @@ async def fill(
     clearFirst: bool = True,
     timeoutMs: int | None = None,
     humanize: bool | None = None,
+    tab: TabArg = None,
 ) -> dict[str, Any]:
     """Type ``value`` into the input/textarea matched by ``selector``.
 
@@ -563,7 +587,7 @@ async def fill(
 
 @mcp.tool(name="upload_file")
 @safeAsync(action="upload_file")
-async def uploadFile(selector: str, filePaths: list[str]) -> dict[str, Any]:
+async def uploadFile(selector: str, filePaths: list[str], tab: TabArg = None) -> dict[str, Any]:
     """Set files on a file ``<input>`` matched by ``selector``.
 
     Args:
@@ -580,6 +604,7 @@ async def downloadFile(
     saveDir: str | None = None,
     timeoutMs: int | None = None,
     imagesOnly: bool = True,
+    tab: TabArg = None,
 ) -> dict[str, Any]:
     """Click ``selector`` to trigger a download and save the resulting file SAFELY.
 
@@ -605,7 +630,7 @@ async def downloadFile(
 
 @mcp.tool(name="press_keys")
 @safeAsync(action="press_keys")
-async def pressKeys(keys: str, selector: str | None = None) -> dict[str, Any]:
+async def pressKeys(keys: str, selector: str | None = None, tab: TabArg = None) -> dict[str, Any]:
     """Press a key or key combination, optionally targeting an element.
 
     Args:
@@ -626,6 +651,7 @@ async def waitForElement(
     selector: str,
     state: str = "visible",
     timeoutMs: int | None = None,
+    tab: TabArg = None,
 ) -> dict[str, Any]:
     """Wait for the element matched by ``selector`` to reach ``state``.
 
@@ -641,7 +667,7 @@ async def waitForElement(
 
 @mcp.tool(name="wait_for_network_idle")
 @safeAsync(action="wait_for_network_idle")
-async def waitForNetworkIdle(timeoutMs: int | None = None) -> dict[str, Any]:
+async def waitForNetworkIdle(timeoutMs: int | None = None, tab: TabArg = None) -> dict[str, Any]:
     """Wait until network activity on the active tab has gone idle.
 
     Args:
@@ -657,6 +683,7 @@ async def waitForStable(
     selector: str,
     stableMs: int = 1200,
     timeoutMs: int | None = None,
+    tab: TabArg = None,
 ) -> dict[str, Any]:
     """Wait QUIETLY until an element's text stops changing, then return its text.
 
@@ -677,7 +704,8 @@ async def waitForStable(
 @mcp.tool(name="wait_for_response")
 @safeAsync(action="wait_for_response")
 async def waitForResponse(
-    urlPattern: str, timeoutMs: int | None = None, includeQuery: bool = False
+    urlPattern: str, timeoutMs: int | None = None, includeQuery: bool = False,
+    tab: TabArg = None,
 ) -> dict[str, Any]:
     """Wait until a network response matching ``urlPattern`` FINISHES.
 
@@ -746,6 +774,7 @@ async def takeScreenshot(
     selector: str | None = None,
     annotate: bool = False,
     label: str | None = None,
+    tab: TabArg = None,
 ) -> dict[str, Any]:
     """Capture a screenshot of the current page or a single element.
 
@@ -765,7 +794,7 @@ async def takeScreenshot(
 
 
 @mcp.tool(name="screenshot")
-async def screenshot(fullPage: bool = False, selector: str | None = None) -> Image:
+async def screenshot(fullPage: bool = False, selector: str | None = None, tab: TabArg = None) -> Image:
     """Capture a screenshot and return it INLINE as an image you can directly see.
 
     This is the primary "let me look at the page" tool — ideal for inspecting the
@@ -848,7 +877,8 @@ async def getTabs() -> dict[str, Any]:
 @mcp.tool(name="get_accessibility_tree")
 @safeAsync(action="get_accessibility_tree")
 async def getAccessibilityTree(
-    interestingOnly: bool = True, root: str | None = None
+    interestingOnly: bool = True, root: str | None = None,
+    tab: TabArg = None,
 ) -> dict[str, Any]:
     """Return the page's accessibility tree (roles/names, as a screen reader sees it).
 
@@ -864,7 +894,7 @@ async def getAccessibilityTree(
 
 @mcp.tool(name="audit_page")
 @safeAsync(action="audit_page")
-async def auditPage(sampleLimit: int = 400) -> dict[str, Any]:
+async def auditPage(sampleLimit: int = 400, tab: TabArg = None) -> dict[str, Any]:
     """Audit the current page for common UI defects (no screenshot needed).
 
     Returns counts plus bounded samples of: horizontal ``overflowIssues``,
@@ -906,7 +936,7 @@ async def compareScreenshots(
 # --------------------------------------------------------------------- #
 @mcp.tool(name="create_snapshot")
 @safeAsync(action="create_snapshot")
-async def createSnapshot(savePath: str | None = None) -> dict[str, Any]:
+async def createSnapshot(savePath: str | None = None, tab: TabArg = None) -> dict[str, Any]:
     """Capture the full browser state to a JSON file: cookies, localStorage,
     sessionStorage, and the open-tab URLs.
 
@@ -922,7 +952,7 @@ async def createSnapshot(savePath: str | None = None) -> dict[str, Any]:
 
 @mcp.tool(name="restore_snapshot")
 @safeAsync(action="restore_snapshot")
-async def restoreSnapshot(path: str, navigate: bool = True) -> dict[str, Any]:
+async def restoreSnapshot(path: str, navigate: bool = True, tab: TabArg = None) -> dict[str, Any]:
     """Restore cookies + storage from a snapshot file saved by ``create_snapshot``.
 
     Because localStorage/sessionStorage are per-origin, the active tab is first
@@ -1011,7 +1041,8 @@ async def replaySession(
 @mcp.tool(name="remember_page")
 @safeAsync(action="remember_page")
 async def rememberPage(
-    tags: list[str] | None = None, withScreenshot: bool = True
+    tags: list[str] | None = None, withScreenshot: bool = True,
+    tab: TabArg = None,
 ) -> dict[str, Any]:
     """Save the CURRENT page into memory so you can recall it later without
     re-scraping (title, URL, structure, and a screenshot).
@@ -1057,7 +1088,7 @@ async def clearMemory() -> dict[str, Any]:
 # --------------------------------------------------------------------- #
 @mcp.tool(name="discover_page")
 @safeAsync(action="discover_page")
-async def discoverPage(url: str | None = None) -> dict[str, Any]:
+async def discoverPage(url: str | None = None, tab: TabArg = None) -> dict[str, Any]:
     """Learn how the CURRENT page works and save a persistent route skill.
 
     Distils the page into purpose, UI, forms, navigation, and inferred workflows,
@@ -1183,7 +1214,8 @@ async def getDiscoveryStatus() -> dict[str, Any]:
 @mcp.tool(name="extract_text_from_screenshot")
 @safeAsync(action="extract_text_from_screenshot")
 async def extractTextFromScreenshot(
-    fullPage: bool = False, selector: str | None = None, lang: str = "eng"
+    fullPage: bool = False, selector: str | None = None, lang: str = "eng",
+    tab: TabArg = None,
 ) -> dict[str, Any]:
     """Screenshot the page (or an element) and OCR the text out of the pixels.
 
@@ -1218,7 +1250,7 @@ async def readImage(source: str, lang: str = "eng") -> dict[str, Any]:
 # --------------------------------------------------------------------- #
 @mcp.tool(name="verify_goal")
 @safeAsync(action="verify_goal")
-async def verifyGoal(goal: str, fullPage: bool = False) -> dict[str, Any]:
+async def verifyGoal(goal: str, fullPage: bool = False, tab: TabArg = None) -> dict[str, Any]:
     """Look at the current page and judge whether a natural-language GOAL is met.
 
     Turns automation into self-correcting automation: e.g.
@@ -1236,7 +1268,7 @@ async def verifyGoal(goal: str, fullPage: bool = False) -> dict[str, Any]:
 
 @mcp.tool(name="find_element")
 @safeAsync(action="find_element")
-async def findElement(description: str, limit: int = 60) -> dict[str, Any]:
+async def findElement(description: str, limit: int = 60, tab: TabArg = None) -> dict[str, Any]:
     """Find the element best matching a natural-language description.
 
     e.g. ``find_element("blue login button")`` returns a usable CSS ``selector``
@@ -1253,7 +1285,8 @@ async def findElement(description: str, limit: int = 60) -> dict[str, Any]:
 @mcp.tool(name="click_by_description")
 @safeAsync(action="click_by_description")
 async def clickByDescription(
-    description: str, limit: int = 60, humanize: bool | None = None
+    description: str, limit: int = 60, humanize: bool | None = None,
+    tab: TabArg = None,
 ) -> dict[str, Any]:
     """Locate an element by description and CLICK it (find_element + click).
 

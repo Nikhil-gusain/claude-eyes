@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import re
 import shutil
+import uuid
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlsplit
@@ -35,6 +36,11 @@ from app.utils.helpers import ensureDir, utcTimestamp
 from app.utils.logger import getLogger
 
 logger = getLogger("browser.controller")
+
+# The tab an action should target, scoped to the current async task (defined in
+# tab_context so low-level modules can import it without a cycle). Re-exported
+# here for the callers that already import it from the controller.
+from app.browser.tab_context import currentTab  # noqa: E402
 
 
 def urlMatches(pattern: str, url: str, includeQuery: bool = False) -> bool:
@@ -224,8 +230,15 @@ class PlaywrightController:
         self._playwright: Optional[Playwright] = None
         self._browser: Optional[Browser] = None
         self._context: Optional[BrowserContext] = None
-        self._pages: list[Page] = []
-        self._activeIndex: int = 0
+        # Tabs keyed by a stable handle (uuid) so a tab keeps its identity even
+        # as siblings open/close — unlike a positional index. ``_tabNames`` maps
+        # the handle to a short human-readable name (e.g. ``tab-1``); both are
+        # accepted wherever a ``tab`` is named. Insertion order == tab order, so
+        # the legacy integer-index tab API still works over ``_ids()``.
+        self._tabs: dict[str, Page] = {}
+        self._tabNames: dict[str, str] = {}
+        self._activeId: Optional[str] = None
+        self._tabCounter: int = 0
 
         # Recording state is owned here because Playwright ties video capture to
         # the *context*; the VideoRecorder coordinates through these fields.
@@ -264,9 +277,58 @@ class PlaywrightController:
 
     @property
     def activePage(self) -> Page:
-        if not self._pages:
+        """The page the current action targets.
+
+        Honours the task-scoped :data:`currentTab` override (set per tool call)
+        so parallel callers each hit their own tab; falls back to the session's
+        active tab when no override is set.
+        """
+        override = currentTab.get()
+        if not self._tabs:
             raise RuntimeError("No open page. Launch the browser and open a URL first.")
-        return self._pages[self._activeIndex]
+        # ``resolveTabId`` accepts a uuid handle OR a friendly name and raises a
+        # clear error for an unknown/closed tab — so we never silently act on the
+        # wrong tab. ``None`` override falls back to the session's active tab.
+        tabId = self.resolveTabId(override) if override is not None else self._activeId
+        if tabId is None or tabId not in self._tabs:
+            raise ValueError(f"No such tab: {override!r}. Open tabs: {list(self._tabNames.values())}")
+        return self._tabs[tabId]
+
+    def _ids(self) -> list[str]:
+        """Tab handles in tab order (insertion order)."""
+        return list(self._tabs.keys())
+
+    def _registerTab(self, page: Page, makeActive: bool = True) -> str:
+        """Record *page* under a fresh handle + friendly name; return the handle."""
+        tabId = uuid.uuid4().hex
+        self._tabCounter += 1
+        self._tabs[tabId] = page
+        self._tabNames[tabId] = f"tab-{self._tabCounter}"
+        if makeActive or self._activeId is None:
+            self._activeId = tabId
+        return tabId
+
+    def _forgetTab(self, tabId: str) -> None:
+        self._tabs.pop(tabId, None)
+        self._tabNames.pop(tabId, None)
+        if self._activeId == tabId:
+            self._activeId = self._ids()[-1] if self._tabs else None
+
+    def resolveTabId(self, tab: str | None) -> str:
+        """Resolve a tab handle or friendly name to a handle. ``None`` -> active."""
+        if tab is None:
+            if self._activeId is None:
+                raise RuntimeError("No open page.")
+            return self._activeId
+        if tab in self._tabs:
+            return tab
+        for tabId, name in self._tabNames.items():
+            if name == tab:
+                return tabId
+        raise ValueError(f"No such tab: {tab!r}. Open tabs: {list(self._tabNames.values())}")
+
+    def _tabIdForPage(self, page: Page) -> str | None:
+        return next((tid for tid, p in self._tabs.items() if p is page), None)
 
     async def launchBrowser(
         self,
@@ -377,8 +439,12 @@ class PlaywrightController:
         pages = list(self._context.pages)
         if not pages:
             pages = [await self._context.new_page()]
-        self._pages = pages
-        self._activeIndex = 0
+        self._tabs = {}
+        self._tabNames = {}
+        self._activeId = None
+        self._tabCounter = 0
+        for page in pages:
+            self._registerTab(page)
         return self._context
 
     # ------------------------------------------------------------------ #
@@ -403,6 +469,7 @@ class PlaywrightController:
                     "status": response.status,
                     "resourceType": request.resource_type,
                     "ok": response.ok,
+                    "tabId": self._tabIdForPage(response.frame.page),
                 }
             )
         except Exception as exc:  # noqa: BLE001 - never let logging break the page
@@ -419,14 +486,26 @@ class PlaywrightController:
                     "resourceType": request.resource_type,
                     "ok": False,
                     "failure": getattr(request.failure, "error_text", str(request.failure)),
+                    "tabId": self._tabIdForPage(request.frame.page),
                 }
             )
         except Exception as exc:  # noqa: BLE001
             logger.debug("Failed to record failed request: %s", exc)
 
-    async def getNetwork(self, limit: int = 100, urlContains: str | None = None) -> dict[str, Any]:
-        """Return the most recent captured network entries (optionally filtered)."""
+    async def getNetwork(
+        self, limit: int = 100, urlContains: str | None = None, allTabs: bool = False
+    ) -> dict[str, Any]:
+        """Return recent network entries for the current tab (optionally filtered).
+
+        Scoped to the acting tab by default so a parallel caller sees only its own
+        traffic; pass ``allTabs=True`` for the whole context.
+        """
         entries = self.networkLog
+        if not allTabs:
+            # The current target tab (honours the per-call override), not just
+            # whichever tab is globally active.
+            tabId = self._tabIdForPage(self.activePage)
+            entries = [e for e in entries if e.get("tabId") == tabId]
         if urlContains:
             entries = [e for e in entries if urlContains in e.get("url", "")]
         sliced = entries[-limit:] if limit and limit > 0 else list(entries)
@@ -458,8 +537,9 @@ class PlaywrightController:
         self._playwright = None
         self._browser = None
         self._context = None
-        self._pages = []
-        self._activeIndex = 0
+        self._tabs = {}
+        self._tabNames = {}
+        self._activeId = None
         logger.info("Browser closed")
         return {"closed": True}
 
@@ -481,7 +561,7 @@ class PlaywrightController:
         """Close the recording context and return the produced WebM path."""
         if self._context is None:
             return None
-        page = self._pages[self._activeIndex] if self._pages else None
+        page = self._tabs.get(self._activeId) if self._activeId else None
         video = page.video if page else None
         await self._context.close()
 
@@ -514,7 +594,8 @@ class PlaywrightController:
         if headless == self.headless:
             return {"headless": headless, "changed": False}
 
-        currentUrl = self._pages[self._activeIndex].url if self._pages else None
+        active = self._tabs.get(self._activeId) if self._activeId else None
+        currentUrl = active.url if active else None
         await self._context.close()
         self.headless = headless
         await self._launchPersistentContext()
@@ -570,31 +651,49 @@ class PlaywrightController:
     # ------------------------------------------------------------------ #
     # Tabs
     # ------------------------------------------------------------------ #
-    async def openNewTab(self, url: str | None = None) -> dict[str, Any]:
+    async def openNewTab(self, url: str | None = None, makeActive: bool = True) -> dict[str, Any]:
+        """Open a tab and return the session snapshot, including its ``tab`` handle.
+
+        With ``makeActive=False`` the tab is created without moving the session's
+        active pointer — so a parallel caller can open a tab for a sub-agent
+        without disturbing whatever the main agent is doing.
+        """
         page = await self._context.new_page()  # type: ignore[union-attr]
-        self._pages.append(page)
-        self._activeIndex = len(self._pages) - 1
+        tabId = self._registerTab(page, makeActive=makeActive)
         if url:
             await page.goto(url, wait_until="networkidle")
-        return self._stateSnapshot()
+        snapshot = self._stateSnapshot()
+        snapshot["tab"] = tabId
+        snapshot["tabName"] = self._tabNames[tabId]
+        return snapshot
 
     async def switchTab(self, index: int) -> dict[str, Any]:
-        if not 0 <= index < len(self._pages):
-            raise IndexError(f"Tab index {index} out of range (0..{len(self._pages) - 1})")
-        self._activeIndex = index
-        await self._pages[index].bring_to_front()
+        ids = self._ids()
+        if not 0 <= index < len(ids):
+            raise IndexError(f"Tab index {index} out of range (0..{len(ids) - 1})")
+        self._activeId = ids[index]
+        await self._tabs[self._activeId].bring_to_front()
         return self._stateSnapshot()
 
-    async def closeTab(self, index: int | None = None) -> dict[str, Any]:
-        target = self._activeIndex if index is None else index
-        if not 0 <= target < len(self._pages):
-            raise IndexError(f"Tab index {target} out of range")
-        await self._pages[target].close()
-        del self._pages[target]
-        if not self._pages:
-            self._activeIndex = 0
+    async def closeTab(self, index: int | None = None, tab: str | None = None) -> dict[str, Any]:
+        """Close a tab by handle/name (``tab``) or positional ``index``.
+
+        Defaults to the current action's tab (the :data:`currentTab` override or
+        the active tab) so a sub-agent can close *its own* tab safely.
+        """
+        if tab is not None:
+            tabId = self.resolveTabId(tab)
+        elif index is not None:
+            ids = self._ids()
+            if not 0 <= index < len(ids):
+                raise IndexError(f"Tab index {index} out of range")
+            tabId = ids[index]
         else:
-            self._activeIndex = min(self._activeIndex, len(self._pages) - 1)
+            # No explicit target -> the current action's tab (honours the
+            # per-call override), so a sub-agent closes *its own* tab.
+            tabId = self._tabIdForPage(self.activePage)
+        await self._tabs[tabId].close()
+        self._forgetTab(tabId)
         return self._stateSnapshot()
 
     # ------------------------------------------------------------------ #
@@ -1008,7 +1107,7 @@ class PlaywrightController:
         open tab actually is.
         """
         tabs: list[dict[str, Any]] = []
-        for index, page in enumerate(self._pages):
+        for index, (tabId, page) in enumerate(self._tabs.items()):
             try:
                 title = await page.title()
             except Exception:  # noqa: BLE001 - a closing/blank tab must not break the list
@@ -1017,13 +1116,16 @@ class PlaywrightController:
             tabs.append(
                 {
                     "index": index,
+                    "tab": tabId,
+                    "name": self._tabNames.get(tabId),
                     "title": title,
                     "url": url,
                     "host": urlsplit(url).netloc or None,
-                    "active": index == self._activeIndex,
+                    "active": tabId == self._activeId,
                 }
             )
-        return {"tabs": tabs, "count": len(tabs), "activeIndex": self._activeIndex}
+        activeIndex = self._ids().index(self._activeId) if self._activeId in self._tabs else 0
+        return {"tabs": tabs, "count": len(tabs), "activeIndex": activeIndex}
 
     async def auditPage(self, sampleLimit: int = 400) -> dict[str, Any]:
         """Run a visual-quality audit of the current page (no screenshot needed).
@@ -1058,8 +1160,8 @@ class PlaywrightController:
             "localStorage": storage.get("local", {}),
             "sessionStorage": storage.get("session", {}),
             "origin": storage.get("origin"),
-            "tabs": [p.url for p in self._pages],
-            "activeIndex": self._activeIndex,
+            "tabs": [p.url for p in self._tabs.values()],
+            "activeIndex": self._ids().index(self._activeId) if self._activeId in self._tabs else 0,
             "url": page.url,
             "capturedAt": utcTimestamp(),
         }
@@ -1098,7 +1200,7 @@ class PlaywrightController:
     # Internal helpers
     # ------------------------------------------------------------------ #
     def _stateSnapshot(self) -> dict[str, Any]:
-        page = self._pages[self._activeIndex] if self._pages else None
+        page = self._tabs.get(self._activeId) if self._activeId else None
         return {
             "running": self.isRunning,
             "headless": self.headless,
@@ -1109,7 +1211,8 @@ class PlaywrightController:
             "userDataDir": str(self.userDataDir),
             "humanize": settings.humanize,
             "stealth": settings.stealth,
-            "tabIndex": self._activeIndex,
-            "tabCount": len(self._pages),
+            "activeTab": self._activeId,
+            "activeTabName": self._tabNames.get(self._activeId) if self._activeId else None,
+            "tabCount": len(self._tabs),
             "url": page.url if page else None,
         }

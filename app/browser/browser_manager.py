@@ -31,6 +31,7 @@ from app.browser.discovery_engine import getDiscoveryEngine
 from app.browser.page_memory import getPageMemory
 from app.browser.website_skills import getWebsiteSkillManager
 from app.browser.playwright_controller import PlaywrightController
+from app.browser.tab_context import currentTab
 from app.browser.profiles import getProfileManager
 from app.browser.screenshot_manager import ScreenshotManager
 from app.browser.session_recorder import SessionRecorder
@@ -67,32 +68,57 @@ class BrowserManager:
         # Global "no-image mode": when on, pixel screenshots are suppressed in
         # favour of MarkItDown text. Starts from the configured default.
         self.noImageMode: bool = settings.noImageMode
-        self._lock = asyncio.Lock()
+        # One lock per tab so actions on different tabs run concurrently (that's
+        # the parallelism win); same-tab actions still serialise. Lifecycle/config
+        # actions with no tab share the "__global__" lock.
+        # ponytail: global lock does NOT block per-tab actions — closing the
+        # browser while a sibling tab is mid-action is a caller error, not the
+        # parallel happy path. Add a barrier here only if that race shows up.
+        self._locks: dict[str, asyncio.Lock] = {}
 
     # ------------------------------------------------------------------ #
     # Envelope plumbing
     # ------------------------------------------------------------------ #
+    def _lockFor(self, tab: str | None) -> asyncio.Lock:
+        """The lock guarding *tab* — a distinct lock per tab, so different tabs
+        run concurrently. Falls back to a shared "__global__" lock when there is
+        no running browser/tab yet (lifecycle actions) or the tab can't resolve.
+        """
+        try:
+            key = self.controller.resolveTabId(tab)
+        except Exception:  # noqa: BLE001 - no browser/tab yet -> global lock
+            key = "__global__"
+        return self._locks.setdefault(key, asyncio.Lock())
+
     async def _run(
         self,
         action: str,
         coro: Callable[[], Awaitable[dict[str, Any]]],
         recordParams: dict[str, Any] | None = None,
+        tab: str | None = None,
     ) -> dict[str, Any]:
-        """Execute *coro* under the lock and wrap the outcome in an envelope.
+        """Execute *coro* on *tab* under that tab's lock, wrapped in an envelope.
 
-        When *recordParams* is supplied the action is replayable: on success it is
-        appended to the active session recording (a no-op if not recording). Only
-        successful actions are logged, so a replay never reproduces a failed step.
+        Sets the task-scoped :data:`currentTab` so every ``activePage`` read
+        inside *coro* targets *tab* (or the active tab when ``None``). When
+        *tab* is ``None`` an already-set override is inherited — so a transport
+        that set the tab upstream (e.g. the MCP ``tab`` param via ``safeAsync``)
+        is honoured. When *recordParams* is supplied the action is replayable.
         """
-        async with self._lock:
-            try:
-                data = await coro()
-                if recordParams is not None:
-                    self.session.record(action, recordParams)
-                return successResponse(action, data)
-            except Exception as exc:  # noqa: BLE001 - surfaced as structured error
-                logger.exception("Action '%s' failed", action)
-                return buildErrorEnvelope(action, exc)
+        effectiveTab = tab if tab is not None else currentTab.get()
+        token = currentTab.set(effectiveTab)
+        try:
+            async with self._lockFor(effectiveTab):
+                try:
+                    data = await coro()
+                    if recordParams is not None:
+                        self.session.record(action, recordParams)
+                    return successResponse(action, data)
+                except Exception as exc:  # noqa: BLE001 - surfaced as structured error
+                    logger.exception("Action '%s' failed", action)
+                    return buildErrorEnvelope(action, exc)
+        finally:
+            currentTab.reset(token)
 
     def _requireRunning(self) -> None:
         if not self.controller.isRunning:
@@ -261,7 +287,7 @@ class BrowserManager:
     # ------------------------------------------------------------------ #
     # Navigation
     # ------------------------------------------------------------------ #
-    async def navigate(self, url: str, waitUntil: str = "networkidle", timeoutMs: int | None = None) -> dict[str, Any]:
+    async def navigate(self, url: str, waitUntil: str = "networkidle", timeoutMs: int | None = None, tab: str | None = None) -> dict[str, Any]:
         async def op() -> dict[str, Any]:
             if not self.controller.isRunning:
                 # Auto-launch uses the active profile if one is set, otherwise the
@@ -284,7 +310,8 @@ class BrowserManager:
             return result
 
         return await self._run(
-            "navigate", op, recordParams={"url": url, "waitUntil": waitUntil, "timeoutMs": timeoutMs}
+            "navigate", op, recordParams={"url": url, "waitUntil": waitUntil, "timeoutMs": timeoutMs},
+            tab=tab,
         )
 
     async def _onNavigated(self, url: str) -> dict[str, Any]:
@@ -325,9 +352,9 @@ class BrowserManager:
     # ------------------------------------------------------------------ #
     # Tabs
     # ------------------------------------------------------------------ #
-    async def openNewTab(self, url: str | None = None) -> dict[str, Any]:
+    async def openNewTab(self, url: str | None = None, makeActive: bool = True) -> dict[str, Any]:
         return await self._run(
-            "open_new_tab", self._guard(lambda: self.controller.openNewTab(url)),
+            "open_new_tab", self._guard(lambda: self.controller.openNewTab(url, makeActive=makeActive)),
             recordParams={"url": url},
         )
 
@@ -337,9 +364,9 @@ class BrowserManager:
             recordParams={"index": index},
         )
 
-    async def closeTab(self, index: int | None = None) -> dict[str, Any]:
+    async def closeTab(self, index: int | None = None, tab: str | None = None) -> dict[str, Any]:
         return await self._run(
-            "close_tab", self._guard(lambda: self.controller.closeTab(index)),
+            "close_tab", self._guard(lambda: self.controller.closeTab(index, tab)),
             recordParams={"index": index},
         )
 
@@ -399,12 +426,13 @@ class BrowserManager:
             recordParams={"selector": selector, "timeoutMs": timeoutMs},
         )
 
-    async def click(self, selector: str, button: str = "left", clickCount: int = 1, timeoutMs: int | None = None, humanize: bool | None = None) -> dict[str, Any]:
+    async def click(self, selector: str, button: str = "left", clickCount: int = 1, timeoutMs: int | None = None, humanize: bool | None = None, tab: str | None = None) -> dict[str, Any]:
         return await self._run(
             "click",
             self._guard(lambda: self.controller.clickElement(selector, button, clickCount, timeoutMs, humanize)),
             recordParams={"selector": selector, "button": button, "clickCount": clickCount,
                           "timeoutMs": timeoutMs, "humanize": humanize},
+            tab=tab,
         )
 
     async def doubleClick(self, selector: str, timeoutMs: int | None = None, humanize: bool | None = None) -> dict[str, Any]:
@@ -419,12 +447,13 @@ class BrowserManager:
             recordParams={"selector": selector, "timeoutMs": timeoutMs, "humanize": humanize},
         )
 
-    async def fill(self, selector: str, value: str, clearFirst: bool = True, timeoutMs: int | None = None, humanize: bool | None = None) -> dict[str, Any]:
+    async def fill(self, selector: str, value: str, clearFirst: bool = True, timeoutMs: int | None = None, humanize: bool | None = None, tab: str | None = None) -> dict[str, Any]:
         return await self._run(
             "fill",
             self._guard(lambda: self.controller.fillInput(selector, value, clearFirst, timeoutMs, humanize)),
             recordParams={"selector": selector, "value": value, "clearFirst": clearFirst,
                           "timeoutMs": timeoutMs, "humanize": humanize},
+            tab=tab,
         )
 
     async def selectOption(self, selector: str, value: str | None = None, label: str | None = None, timeoutMs: int | None = None) -> dict[str, Any]:
@@ -483,9 +512,10 @@ class BrowserManager:
         selector: str | None = None,
         annotate: bool = False,
         label: str | None = None,
+        tab: str | None = None,
     ) -> dict[str, Any]:
         if self.noImageMode:
-            return await self._run("take_screenshot", lambda: self._async(self._noImageNotice()))
+            return await self._run("take_screenshot", lambda: self._async(self._noImageNotice()), tab=tab)
         return await self._run(
             "take_screenshot",
             self._guard(
@@ -497,10 +527,11 @@ class BrowserManager:
                     label=label,
                 )
             ),
+            tab=tab,
         )
 
     async def captureScreenshotData(
-        self, fullPage: bool = False, selector: str | None = None
+        self, fullPage: bool = False, selector: str | None = None, tab: str | None = None
     ) -> dict[str, Any]:
         """Capture a screenshot in memory (no file). ``data.image`` holds PNG bytes.
 
@@ -508,7 +539,7 @@ class BrowserManager:
         without persisting anything to disk.
         """
         if self.noImageMode:
-            return await self._run("screenshot", lambda: self._async(self._noImageNotice()))
+            return await self._run("screenshot", lambda: self._async(self._noImageNotice()), tab=tab)
         return await self._run(
             "screenshot",
             self._guard(
@@ -516,6 +547,7 @@ class BrowserManager:
                     self.controller.activePage, fullPage=fullPage, selector=selector
                 )
             ),
+            tab=tab,
         )
 
     # ------------------------------------------------------------------ #
@@ -601,10 +633,11 @@ class BrowserManager:
     # ------------------------------------------------------------------ #
     # Network inspection
     # ------------------------------------------------------------------ #
-    async def getNetwork(self, limit: int = 100, urlContains: str | None = None) -> dict[str, Any]:
+    async def getNetwork(self, limit: int = 100, urlContains: str | None = None, allTabs: bool = False, tab: str | None = None) -> dict[str, Any]:
         return await self._run(
             "get_network",
-            self._guard(lambda: self.controller.getNetwork(limit, urlContains)),
+            self._guard(lambda: self.controller.getNetwork(limit, urlContains, allTabs)),
+            tab=tab,
         )
 
     async def clearNetwork(self) -> dict[str, Any]:
@@ -613,7 +646,7 @@ class BrowserManager:
     # ------------------------------------------------------------------ #
     # Aggregate page read (one call returns title + url + text + structure)
     # ------------------------------------------------------------------ #
-    async def readPage(self, textLimit: int = 5000) -> dict[str, Any]:
+    async def readPage(self, textLimit: int = 5000, tab: str | None = None) -> dict[str, Any]:
         async def op() -> dict[str, Any]:
             title = await self.controller.getTitle()
             url = await self.controller.getUrl()
@@ -634,7 +667,7 @@ class BrowserManager:
                 "imageCount": images.get("count", 0),
             }
 
-        return await self._run("read_page", self._guard(op))
+        return await self._run("read_page", self._guard(op), tab=tab)
 
     # ------------------------------------------------------------------ #
     # Accessibility / page audit

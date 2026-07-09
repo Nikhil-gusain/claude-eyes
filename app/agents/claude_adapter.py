@@ -26,6 +26,7 @@ from typing import Any
 
 from app.browser import intelligence
 from app.browser.browser_manager import getBrowserManager
+from app.browser.tab_context import currentTab
 from app.browser.session_pool import (
     closeSession,
     createSession,
@@ -61,7 +62,13 @@ SYSTEM_PROMPT = (
     "a different company's product or a look-alike: a ChatGPT task does not belong on "
     "openai.com/dall-e, huggingface.co, or any other provider unless the user "
     "explicitly asks for it. If the named site can't do what's asked, say so rather "
-    "than silently wandering to a different one."
+    "than silently wandering to a different one.\n\n"
+    "Some actions kick off slow background work (a PageSpeed/Lighthouse audit, a "
+    "report generation, an upload) that is NOT done just because the click "
+    "succeeded. After triggering one, call wait_for_element on the actual result "
+    "element (or wait_for_network_idle) with a generous timeoutMs (30000-60000) "
+    "before you try to read the result — reading too early gets you a loading "
+    "state instead of real data."
 )
 
 
@@ -940,6 +947,30 @@ TOOL_SPECS: list[dict[str, Any]] = [
 ]
 
 
+# Every per-page tool becomes tab-addressable: inject an optional ``tab`` param
+# into its schema (one loop beats editing ~40 specs by hand). ``dispatchTool``
+# reads it into the task-scoped ``currentTab`` so the whole call hits that tab.
+_TAB_ADDRESSABLE = {
+    "navigate", "navigate_back", "navigate_forward", "refresh", "close_tab",
+    "get_title", "get_url", "extract_text", "extract_links", "extract_buttons",
+    "extract_forms", "extract_images", "get_dom", "read_page", "get_network",
+    "scroll", "hover", "click", "double_click", "right_click", "fill",
+    "upload_file", "download_file", "press_keys", "wait_for_element",
+    "wait_for_network_idle", "wait_for_stable", "wait_for_response",
+    "take_screenshot", "screenshot", "get_accessibility_tree", "audit_page",
+    "create_snapshot", "restore_snapshot", "remember_page", "discover_page",
+    "extract_text_from_screenshot", "verify_goal", "find_element",
+    "click_by_description",
+}
+for _spec in TOOL_SPECS:
+    if _spec["name"] in _TAB_ADDRESSABLE:
+        _spec["parameters"]["properties"]["tab"] = {
+            "type": "string",
+            "description": "Tab handle or friendly name (from open_new_tab / get_tabs) "
+                           "to act on. Omit to use the active tab.",
+        }
+
+
 # --------------------------------------------------------------------------- #
 # Canonical async dispatcher (shared by both adapters)
 # --------------------------------------------------------------------------- #
@@ -957,6 +988,9 @@ async def dispatchTool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     """
     arguments = arguments or {}
     manager = getBrowserManager()
+    # Scope this whole call to the requested tab (None clears any prior value),
+    # so the manager's per-page methods act on it via the inherited override.
+    currentTab.set(arguments.get("tab"))
     logger.info("Dispatching tool '%s' with args: %s", name, arguments)
 
     if name == "open_browser":
