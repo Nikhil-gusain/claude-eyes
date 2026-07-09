@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "ai-browser": {
+      "type": "stdio",
+      "command": ".venv/bin/python",
+      "args": ["start.py", "mcp"],
+      "env": {
+        "ABC_HEADLESS": "false",
+        "ABC_BROWSER_CHANNEL": "chrome",
+        "ABC_HUMANIZE": "true"
+      }
+    }
+  }
+}
