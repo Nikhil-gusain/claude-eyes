@@ -14,11 +14,18 @@ place to fan out to all connected agents.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any, Awaitable, Callable
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from app.browser.browser_manager import BrowserManager, getBrowserManager
+from app.browser.session_pool import (
+    closeSession,
+    createSession,
+    listSessions,
+    switchSession,
+)
 from app.utils.helpers import errorResponse
 from app.utils.logger import getLogger
 
@@ -32,6 +39,11 @@ class ConnectionManager:
 
     def __init__(self) -> None:
         self.activeConnections: list[WebSocket] = []
+        # SSE subscribers: each is an async queue fed by :meth:`publish`. SSE is a
+        # lightweight, one-way (server -> client) push — ideal for streaming
+        # progress / "long wait finished" events to plain HTTP clients without the
+        # overhead of a full WebSocket.
+        self.sseQueues: list[asyncio.Queue[dict[str, Any]]] = []
 
     async def connect(self, websocket: WebSocket) -> None:
         """Accept *websocket* and register it as active."""
@@ -60,6 +72,31 @@ class ConnectionManager:
                 stale.append(connection)
         for connection in stale:
             self.disconnect(connection)
+        self.publish(payload)
+
+    # ------------------------------------------------------------------ #
+    # SSE (server-sent events) — lightweight one-way push to HTTP clients
+    # ------------------------------------------------------------------ #
+    def subscribe(self) -> "asyncio.Queue[dict[str, Any]]":
+        """Register and return a queue that receives every published event."""
+        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        self.sseQueues.append(queue)
+        logger.info("SSE subscriber added (%d active)", len(self.sseQueues))
+        return queue
+
+    def unsubscribe(self, queue: "asyncio.Queue[dict[str, Any]]") -> None:
+        """Drop an SSE subscriber queue (idempotent)."""
+        if queue in self.sseQueues:
+            self.sseQueues.remove(queue)
+        logger.info("SSE subscriber removed (%d active)", len(self.sseQueues))
+
+    def publish(self, payload: dict[str, Any]) -> None:
+        """Fan *payload* out to every SSE subscriber (non-blocking, best-effort)."""
+        for queue in list(self.sseQueues):
+            try:
+                queue.put_nowait(payload)
+            except Exception:  # noqa: BLE001 - a full/closed queue must not stop the rest
+                logger.debug("Failed to enqueue SSE payload for a subscriber")
 
 
 # Process-wide connection registry shared across all ``/ws`` handlers.
@@ -76,6 +113,16 @@ connectionManager = ConnectionManager()
 DispatchFn = Callable[[BrowserManager, dict[str, Any]], Awaitable[dict[str, Any]]]
 
 
+async def _async(value: dict[str, Any]) -> dict[str, Any]:
+    """Wrap an already-computed envelope as an awaitable for the dispatch table.
+
+    The session-pool helpers are synchronous (they return a ready envelope); the
+    dispatch table expects every handler to return an awaitable, so they pass
+    through here.
+    """
+    return value
+
+
 def _buildDispatchTable() -> dict[str, DispatchFn]:
     """Construct the action-name -> manager-call dispatch table."""
     return {
@@ -84,6 +131,16 @@ def _buildDispatchTable() -> dict[str, DispatchFn]:
         "close_browser": lambda manager, params: manager.closeBrowser(),
         "set_headless": lambda manager, params: manager.setHeadless(params.get("headless", True)),
         "clear_profile": lambda manager, params: manager.clearProfile(),
+        # Profiles
+        "list_profiles": lambda manager, params: manager.listProfiles(),
+        "select_profile": lambda manager, params: manager.selectProfile(params["name"]),
+        "create_profile": lambda manager, params: manager.createProfile(
+            params["name"], makeActive=params.get("makeActive", True)
+        ),
+        "get_active_profile": lambda manager, params: manager.getActiveProfile(),
+        "login_session": lambda manager, params: manager.loginSession(
+            profile=params.get("profile"), url=params.get("url")
+        ),
         # Navigation
         "navigate": lambda manager, params: manager.navigate(
             params["url"],
@@ -116,18 +173,20 @@ def _buildDispatchTable() -> dict[str, DispatchFn]:
             button=params.get("button", "left"),
             clickCount=params.get("clickCount", 1),
             timeoutMs=params.get("timeoutMs"),
+            humanize=params.get("humanize"),
         ),
         "double_click": lambda manager, params: manager.doubleClick(
-            params["selector"], timeoutMs=params.get("timeoutMs")
+            params["selector"], timeoutMs=params.get("timeoutMs"), humanize=params.get("humanize")
         ),
         "right_click": lambda manager, params: manager.rightClick(
-            params["selector"], timeoutMs=params.get("timeoutMs")
+            params["selector"], timeoutMs=params.get("timeoutMs"), humanize=params.get("humanize")
         ),
         "fill": lambda manager, params: manager.fill(
             params["selector"],
             params["value"],
             clearFirst=params.get("clearFirst", True),
             timeoutMs=params.get("timeoutMs"),
+            humanize=params.get("humanize"),
         ),
         "upload_file": lambda manager, params: manager.uploadFile(
             params["selector"], params["filePaths"]
@@ -136,6 +195,7 @@ def _buildDispatchTable() -> dict[str, DispatchFn]:
             params["selector"],
             saveDir=params.get("saveDir"),
             timeoutMs=params.get("timeoutMs"),
+            imagesOnly=params.get("imagesOnly", True),
         ),
         "press_keys": lambda manager, params: manager.pressKeys(
             params["keys"], selector=params.get("selector")
@@ -148,6 +208,21 @@ def _buildDispatchTable() -> dict[str, DispatchFn]:
         ),
         "wait_for_network_idle": lambda manager, params: manager.waitForNetworkIdle(
             timeoutMs=params.get("timeoutMs")
+        ),
+        "wait_for_stable": lambda manager, params: manager.waitForStable(
+            params["selector"],
+            stableMs=params.get("stableMs", 1200),
+            timeoutMs=params.get("timeoutMs"),
+        ),
+        "wait_for_response": lambda manager, params: manager.waitForResponse(
+            params["urlPattern"],
+            timeoutMs=params.get("timeoutMs"),
+            includeQuery=params.get("includeQuery", False),
+        ),
+        # No-image mode (MarkItDown)
+        "to_markdown": lambda manager, params: manager.toMarkdown(params["source"]),
+        "set_no_image_mode": lambda manager, params: manager.setNoImageMode(
+            params.get("enabled", True)
         ),
         # Visual intelligence
         "take_screenshot": lambda manager, params: manager.takeScreenshot(
@@ -173,6 +248,108 @@ def _buildDispatchTable() -> dict[str, DispatchFn]:
         ),
         "clear_network": lambda manager, params: manager.clearNetwork(),
         "clear_storage": lambda manager, params: manager.clearStorage(params.get("kinds")),
+        # Tab intelligence
+        "get_tabs": lambda manager, params: manager.getTabs(),
+        # Accessibility & visual QA
+        "get_accessibility_tree": lambda manager, params: manager.getAccessibilityTree(
+            params.get("interestingOnly", True), params.get("root")
+        ),
+        "audit_page": lambda manager, params: manager.auditPage(params.get("sampleLimit", 400)),
+        "compare_screenshots": lambda manager, params: manager.compareScreenshots(
+            params["before"],
+            params["after"],
+            pixelThreshold=params.get("pixelThreshold", 60),
+            saveDiff=params.get("saveDiff", False),
+        ),
+        # Browser-state snapshot
+        "create_snapshot": lambda manager, params: manager.createSnapshot(
+            savePath=params.get("savePath")
+        ),
+        "restore_snapshot": lambda manager, params: manager.restoreSnapshot(
+            path=params.get("path"),
+            snapshot=params.get("snapshot"),
+            navigate=params.get("navigate", True),
+        ),
+        # Session replay (structured action log)
+        "start_session": lambda manager, params: manager.startSession(params.get("name")),
+        "stop_session": lambda manager, params: manager.stopSession(),
+        "get_session": lambda manager, params: manager.getSession(),
+        "save_session": lambda manager, params: manager.saveSession(params.get("path")),
+        "load_session": lambda manager, params: manager.loadSession(params["path"]),
+        "replay_session": lambda manager, params: manager.replaySession(
+            path=params.get("path"),
+            delayMs=params.get("delayMs", 500),
+            continueOnError=params.get("continueOnError", True),
+        ),
+        # Browser memory
+        "remember_page": lambda manager, params: manager.rememberPage(
+            tags=params.get("tags"), withScreenshot=params.get("withScreenshot", True)
+        ),
+        "search_memory": lambda manager, params: manager.searchMemory(
+            params["query"], limit=params.get("limit", 10)
+        ),
+        "list_memory": lambda manager, params: manager.listMemory(limit=params.get("limit", 50)),
+        "clear_memory": lambda manager, params: manager.clearMemory(),
+        # Website Skill System
+        "discover_page": lambda manager, params: manager.discoverPage(params.get("url")),
+        "discover_website": lambda manager, params: manager.discoverWebsite(
+            startUrl=params.get("startUrl"), maxPages=params.get("maxPages", 10)
+        ),
+        "update_skill": lambda manager, params: manager.updateSkill(
+            params["url"], success=params.get("success"),
+            confidenceDelta=params.get("confidenceDelta"),
+        ),
+        "list_skills": lambda manager, params: manager.listSkills(params.get("domain")),
+        "search_skills": lambda manager, params: manager.searchSkills(
+            params["query"], limit=params.get("limit", 20)
+        ),
+        "export_skills": lambda manager, params: manager.exportSkills(
+            params.get("domain"), savePath=params.get("savePath")
+        ),
+        "import_skills": lambda manager, params: manager.importSkills(
+            bundle=params.get("bundle"), path=params.get("path"),
+            overwrite=params.get("overwrite", False),
+        ),
+        "clear_skills": lambda manager, params: manager.clearSkills(params.get("domain")),
+        "set_discovery_mode": lambda manager, params: manager.setDiscoveryMode(params["mode"]),
+        "get_discovery_status": lambda manager, params: manager.getDiscoveryStatus(),
+        # OCR
+        "extract_text_from_screenshot": lambda manager, params: manager.extractTextFromScreenshot(
+            fullPage=params.get("fullPage", False),
+            selector=params.get("selector"),
+            lang=params.get("lang", "eng"),
+        ),
+        "read_image": lambda manager, params: manager.readImage(
+            params["source"], lang=params.get("lang", "eng")
+        ),
+        # AI judgment (provider-backed)
+        "verify_goal": lambda manager, params: manager.verifyGoal(
+            params["goal"], fullPage=params.get("fullPage", False)
+        ),
+        "find_element": lambda manager, params: manager.findElement(
+            params["description"], limit=params.get("limit", 60)
+        ),
+        "click_by_description": lambda manager, params: manager.clickByDescription(
+            params["description"], limit=params.get("limit", 60), humanize=params.get("humanize")
+        ),
+        "plan_actions": lambda manager, params: manager.planActions(
+            params["goal"], includeContext=params.get("includeContext", True)
+        ),
+        # Workflows
+        "save_workflow": lambda manager, params: manager.saveWorkflow(params["name"]),
+        "run_workflow": lambda manager, params: manager.runWorkflow(
+            params["name"],
+            delayMs=params.get("delayMs", 500),
+            continueOnError=params.get("continueOnError", True),
+        ),
+        "list_workflows": lambda manager, params: manager.listWorkflows(),
+        # Browser sessions (pool) — these act on the pool, not a single manager.
+        "create_session": lambda manager, params: _async(
+            createSession(params.get("sessionId"), makeActive=params.get("makeActive", True))
+        ),
+        "list_sessions": lambda manager, params: _async(listSessions()),
+        "switch_session": lambda manager, params: _async(switchSession(params["sessionId"])),
+        "close_session": lambda manager, params: closeSession(params.get("sessionId")),
     }
 
 

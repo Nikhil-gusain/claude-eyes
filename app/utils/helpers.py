@@ -9,6 +9,7 @@ OpenAI, and raw HTTP clients all see identical structures.
 from __future__ import annotations
 
 import re
+import secrets
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -27,10 +28,14 @@ def ensureDir(path: Path | str) -> Path:
 
 
 def generateSessionName(prefix: str = "session") -> str:
-    """Build a filesystem-safe, time-ordered session identifier."""
+    """Build a filesystem-safe, time-ordered, unique session identifier.
+
+    The random suffix keeps names unique when two calls land on the same clock
+    tick (Windows timestamps are coarse enough for that to happen).
+    """
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
     safePrefix = re.sub(r"[^a-zA-Z0-9_-]+", "-", prefix).strip("-") or "session"
-    return f"{safePrefix}-{stamp}"
+    return f"{safePrefix}-{stamp}-{secrets.token_hex(2)}"
 
 
 def successResponse(action: str, data: dict[str, Any] | None = None) -> dict[str, Any]:

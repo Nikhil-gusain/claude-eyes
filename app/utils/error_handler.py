@@ -29,6 +29,7 @@ import functools
 import inspect
 from typing import Any, Awaitable, Callable, TypeVar
 
+from app.browser.tab_context import currentTab
 from app.utils.helpers import errorResponse
 from app.utils.logger import getLogger
 
@@ -121,6 +122,10 @@ def safeAsync(action: str | None = None) -> Callable[[F], F]:
 
         @functools.wraps(fn)
         async def wrapper(*args: Any, **kwargs: Any) -> Any:
+            # A ``tab`` argument (present on tab-addressable tools) targets that
+            # tab for the whole call: set the task-scoped override here so every
+            # ``activePage`` read below hits it. ``None`` -> active tab (default).
+            token = currentTab.set(kwargs["tab"]) if kwargs.get("tab") is not None else None
             try:
                 return await fn(*args, **kwargs)
             except BrowserControllerError as exc:
@@ -129,6 +134,9 @@ def safeAsync(action: str | None = None) -> Callable[[F], F]:
             except Exception as exc:  # noqa: BLE001 - intentional catch-all boundary
                 logger.exception("Unhandled error in '%s'", resolvedAction)
                 return buildErrorEnvelope(resolvedAction, exc)
+            finally:
+                if token is not None:
+                    currentTab.reset(token)
 
         return wrapper  # type: ignore[return-value]
 

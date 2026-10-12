@@ -29,9 +29,12 @@ htmlcov/
 !.env.example
 
 # --- Runtime storage: keep every folder (via .gitkeep), never its contents --
-# Covers screenshots/, recordings/, downloads/ and the persistent browser
-# profiles (browser_profile/, chrome_profile/), which hold cookies, session
-# tokens and logged-in accounts. NEVER commit these.
+# Covers screenshots/, recordings/, downloads/, sessions/, diffs/, memory/,
+# workflows/, website_skills/ and the persistent browser profiles
+# (browser_profile/, chrome_profile/, profiles/, active_profile.json), which
+# hold cookies, session tokens and logged-in accounts. NEVER commit these.
+app/storage/*
+!app/storage/*/
 app/storage/*/*
 !app/storage/*/.gitkeep
 
@@ -57,6 +60,7 @@ TASKS.md
 NOTES.md
 TODO.md
 SCRATCH.md
+CLAUDE.md
 *.local.md
 
 # --- Logs ------------------------------------------------------------------
