@@ -128,6 +128,12 @@ class PlaywrightController:
             "viewport": {"width": self.viewportWidth, "height": self.viewportHeight},
             "accept_downloads": True,
         }
+        if self.browserType == "chromium" and settings.browserChannel:
+            # Real Chrome + no automation banner: Google rejects logins from
+            # bundled Chromium ("browser not supported").
+            contextArgs["channel"] = settings.browserChannel
+            contextArgs["args"] = ["--disable-blink-features=AutomationControlled"]
+            contextArgs["ignore_default_args"] = ["--enable-automation"]
         if self.userAgent:
             contextArgs["user_agent"] = self.userAgent
         if self.recordVideoDir is not None:

@@ -28,7 +28,22 @@ from app.utils.logger import getLogger
 
 logger = getLogger("mcp.server")
 
-mcp = FastMCP("ai-browser-controller")
+mcp = FastMCP(
+    "ai-browser-controller",
+    instructions=(
+        "Drive a real Chromium browser: see pages, click, fill, read DOM/network.\n"
+        "- `screenshot` returns the image inline (nothing written to disk); "
+        "`take_screenshot` is the only one that saves a file.\n"
+        "- Video recording exists: `start_recording(fps, sessionName)` / `stop_recording`. "
+        "It is never automatic. Recording restarts the browser context, so the current page "
+        "reloads on start (URL is preserved), and the video is only flushed on stop. "
+        "`stop_recording` returns {video_path, duration, resolution, fps} \u2014 MP4 when ffmpeg "
+        "is available, otherwise a playable WebM.\n"
+        "- The profile is persistent: logins survive restarts. Use "
+        "`set_headless(headless=false)` when a human must act (captcha, first login).\n"
+        "- `clear_storage` deletes saved screenshots/recordings/downloads on demand."
+    ),
+)
 
 
 # --------------------------------------------------------------------- #

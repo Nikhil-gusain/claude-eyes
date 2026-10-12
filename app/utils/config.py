@@ -62,6 +62,8 @@ class Settings:
         self.viewportHeight: int = _envInt("ABC_VIEWPORT_HEIGHT", 800)
         self.defaultTimeoutMs: int = _envInt("ABC_TIMEOUT_MS", 30_000)
         self.userAgent: str | None = os.getenv("ABC_USER_AGENT") or None
+        # Real Chrome instead of bundled Chromium (Google blocks Chromium logins).
+        self.browserChannel: str | None = os.getenv("ABC_CHANNEL") or None
 
         # ----- Recording defaults ------------------------------------------
         self.recordingFps: int = _envInt("ABC_RECORDING_FPS", 24)

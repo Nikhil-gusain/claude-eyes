@@ -28,15 +28,12 @@ htmlcov/
 .env.*
 !.env.example
 
-# --- Stored media: ignore CONTENTS but keep the folders via .gitkeep -------
-app/storage/screenshots/*
-app/storage/recordings/*
-app/storage/downloads/
-!app/storage/screenshots/.gitkeep
-!app/storage/recordings/.gitkeep
-
-# --- Persistent browser profile: cookies/tokens/logins — NEVER commit -------
-app/storage/browser_profile/
+# --- Runtime storage: keep every folder (via .gitkeep), never its contents --
+# Covers screenshots/, recordings/, downloads/ and the persistent browser
+# profiles (browser_profile/, chrome_profile/), which hold cookies, session
+# tokens and logged-in accounts. NEVER commit these.
+app/storage/*/*
+!app/storage/*/.gitkeep
 
 # --- Generated captures / reports at the project root ----------------------
 # Screenshots, videos, and JSON dumps produced by runs or demo scripts.
