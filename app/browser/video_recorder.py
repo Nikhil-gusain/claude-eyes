@@ -151,6 +151,10 @@ class VideoRecorder:
             str(self.fps),
             "-c:v",
             "libx264",
+            # The default "medium" preset took ~6 min for a 3.5 min 1440x900
+            # take, blocking stop_recording the whole time.
+            "-preset",
+            "veryfast",
             "-pix_fmt",
             "yuv420p",
             str(destination),
