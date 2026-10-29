@@ -37,6 +37,8 @@ from app.browser.session_pool import (
 )
 from app.models.commands import (
     AccessibilityCommand,
+    AddCssCommand,
+    AddInitJsCommand,
     AuditCommand,
     ClickByDescriptionCommand,
     ClickCommand,
@@ -65,6 +67,7 @@ from app.models.commands import (
     RecordingCommand,
     RememberPageCommand,
     ReplaySessionCommand,
+    RunJsCommand,
     RunWorkflowCommand,
     ScreenshotCommand,
     ScrollCommand,
@@ -365,6 +368,26 @@ def createApp() -> FastAPI:
         return await getBrowserManager().hover(
             command.selector, timeoutMs=command.timeoutMs
         )
+
+    @app.post("/inject/js")
+    async def runJs(command: RunJsCommand) -> dict:
+        logger.info("Request: run_js")
+        return await getBrowserManager().runJs(command.script, command.arg, tab=command.tab)
+
+    @app.post("/inject/css")
+    async def addCss(command: AddCssCommand) -> dict:
+        logger.info("Request: add_css")
+        return await getBrowserManager().addCss(command.css, tab=command.tab)
+
+    @app.post("/inject/init-js")
+    async def addInitJs(command: AddInitJsCommand) -> dict:
+        logger.info("Request: add_init_js -> %s", command.name)
+        return await getBrowserManager().addInitJs(command.script, name=command.name)
+
+    @app.post("/inject/init-js/clear")
+    async def clearInitJs() -> dict:
+        logger.info("Request: clear_init_js")
+        return await getBrowserManager().clearInitJs()
 
     @app.post("/interact/fill")
     async def fill(command: FillCommand) -> dict:

@@ -4,16 +4,17 @@
 
 **Give your AI agent a real browser — and let it actually *see*.**
 
-A plug-and-play browser layer that lets Claude, Gemini, or GPT navigate, inspect, click, type, screenshot, record, and learn real websites. It acts like a person (human-paced typing, curved mouse movement), keeps you **logged in** across runs, drives **many tabs in parallel**, and returns **one consistent JSON contract** over MCP, REST, and WebSocket.
+A plug-and-play browser layer that lets Claude, Gemini, or GPT navigate, inspect, click, type, screenshot, record, and learn real websites. It acts like a person (human-paced typing, curved mouse movement), keeps you **logged in** across runs, drives **many tabs in parallel**, can **draw tutorial overlays into its own screen recordings**, and returns **one consistent JSON contract** over MCP, REST, and WebSocket.
 
 [![Python](https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![Playwright](https://img.shields.io/badge/powered%20by-Playwright-2EAD33?logo=playwright&logoColor=white)](https://playwright.dev/python/)
-[![MCP](https://img.shields.io/badge/MCP-87%20tools-8A2BE2)](https://modelcontextprotocol.io/)
+[![MCP](https://img.shields.io/badge/MCP-91%20tools-8A2BE2)](https://modelcontextprotocol.io/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-REST%20%2B%20WebSocket-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
-[![Tests](https://img.shields.io/badge/tests-107%20passing-brightgreen)](tests/)
+[![Tests](https://img.shields.io/badge/tests-108%20passing-brightgreen)](tests/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
+[![PRs welcome](https://img.shields.io/badge/PRs-welcome-ff69b4.svg)](#-contributing)
 
-[Quick start](#-quick-start) · [Why not Playwright MCP?](#-why-claude-eyes-over-playwright-mcp) · [Features](#-features) · [MCP tools](#-mcp-tools) · [REST API](#-rest--websocket-api) · [Configuration](#%EF%B8%8F-configuration)
+[Quick start](#-quick-start) · [Why not Playwright MCP?](#-why-claude-eyes-over-playwright-mcp) · [Features](#-features) · [Tutorial overlays](#-tutorial-overlays--live-jscss-injection) · [MCP tools](#-mcp-tools) · [REST API](#-rest--websocket-api) · [Configuration](#%EF%B8%8F-configuration) · [Troubleshooting](#-troubleshooting)
 
 </div>
 
@@ -42,6 +43,7 @@ Claude: navigate → screenshot (inline) → read_page → audit_page → click 
 | 🔍 **Visual QA** | Inline screenshots, `compare_screenshots` visual diff, `audit_page` (overflow, broken images, contrast), accessibility tree, and OCR. |
 | ⏳ **Smart waiting** | `wait_for_stable` waits until streamed text (such as another AI's answer) stops changing. `wait_for_response` waits for a matching network response. |
 | 🎬 **Record & replay** | MP4 recording, replayable JSON action logs, named workflows, and browser-state snapshots. |
+| 🎨 **Tutorial overlays** | `run_js`, `add_css`, and `add_init_js` let the agent draw captions, arrows, spotlights, zoom, and click markers on the page. They appear in the recorded video, and init scripts survive the recording relaunch. |
 | 🔌 **Three transports, one contract** | MCP (stdio), FastAPI REST + SSE, and WebSocket all return the same `success / action / data` envelope. |
 | 🤖 **Bring your own brain** | `python start.py agent "<task>"` runs an autonomous loop with **Gemini** (default), Claude, or OpenAI. The Studio web UI lets you watch the agent and steer it while it works. |
 
@@ -187,9 +189,46 @@ See [usage.md](usage.md) for agent flags, API keys, and the Studio protocol.
 
 </details>
 
+## 🎨 Tutorial overlays & live JS/CSS injection
+
+Playwright's video has **no mouse cursor**, so a raw recording doesn't show where the agent clicked. Claude Eyes lets the agent draw on the page while it records, so it can produce a narrated walkthrough with captions, arrows, spotlights, zoom, and toasts.
+
+| Tool | Scope | What it does |
+|---|---|---|
+| `run_js(script, arg?, tab?)` | Current page | Runs a function (`"(a) => …"`) or a bare expression (`"1+1"`) and returns `{ok, result}`. A JS exception returns `{ok: false, error}` instead of failing the call. Results over 20k characters are truncated. |
+| `add_css(css, tab?)` | Current page | Injects a `<style>` tag. It's gone after the page navigates. |
+| `add_init_js(script, name?)` | Every future page load, in every tab | Runs before the page's own scripts. Re-applied whenever the browser context relaunches, including on `start_recording` / `stop_recording`. Reusing a `name` replaces the earlier script. |
+| `clear_init_js()` | — | Forgets every `add_init_js` script, from the next context launch on. |
+
+**Example: show a click in a tutorial video**
+
+```text
+start_recording(sessionName="signup-tutorial")
+add_init_js(name="caption", script="addEventListener('DOMContentLoaded', () => {
+    const c = Object.assign(document.createElement('div'), { id: 'tut-caption' });
+    c.style.cssText = 'position:fixed;bottom:24px;left:50%;transform:translateX(-50%);'
+        + 'padding:10px 18px;background:#111c;color:#fff;font:600 18px system-ui;'
+        + 'border-radius:10px;z-index:2147483647';
+    document.body.append(c);
+})")
+navigate("https://example.com/signup")
+run_js("(t) => document.getElementById('tut-caption').textContent = t", arg="Step 1: open the sign-up form")
+run_js("(sel) => { const r = document.querySelector(sel).getBoundingClientRect();
+    const d = document.createElement('div');
+    d.style.cssText = `position:fixed;left:${r.x + r.width/2 - 20}px;top:${r.y + r.height/2 - 20}px;`
+        + 'width:40px;height:40px;border:3px solid #f43;border-radius:50%;z-index:2147483647';
+    document.body.append(d); setTimeout(() => d.remove(), 1200); }", arg="#submit")
+click("#submit")
+stop_recording()
+```
+
+> **Tip:** to put an overlay on every page from the start, point `ABC_INIT_SCRIPT` at a JS file. It's injected before any `add_init_js` scripts.
+>
+> **Note:** Playwright can't remove an init script from a running context. When you replace a named script or call `clear_init_js`, the old version keeps running until the next relaunch, so write overlay scripts to be safe to run twice (for example, check for an existing element `id` first).
+
 ## 🧰 MCP tools
 
-87 tools, all snake_case:
+91 tools, all snake_case:
 
 | Group | Tools |
 |---|---|
@@ -205,6 +244,7 @@ See [usage.md](usage.md) for agent flags, API keys, and the Studio protocol.
 | **Memory** | `remember_page`, `search_memory`, `list_memory`, `clear_memory` |
 | **State & replay** | `create_snapshot`, `restore_snapshot`, `start_session`, `stop_session`, `save_session`, `load_session`, `replay_session`, `save_workflow`, `run_workflow`, `list_workflows` |
 | **Recording & storage** | `start_recording`, `stop_recording`, `clear_storage` |
+| **Page scripting & overlays** | `run_js`, `add_css`, `add_init_js`, `clear_init_js` |
 | **Session pool** | `create_session`, `list_sessions`, `switch_session`, `close_session` |
 
 ## 🌐 REST & WebSocket API
@@ -219,9 +259,12 @@ curl -X POST http://127.0.0.1:8000/navigate -H "Content-Type: application/json" 
 
 curl -X POST http://127.0.0.1:8000/read-page -H "Content-Type: application/json" -d '{}'
 curl "http://127.0.0.1:8000/network?urlContains=/api/"
+
+curl -X POST http://127.0.0.1:8000/inject/js -H "Content-Type: application/json" \
+     -d '{"script":"document.title"}'      # also /inject/css, /inject/init-js, /inject/init-js/clear
 ```
 
-The API exposes the same capabilities as the MCP tools (89 routes); browse them all at `/docs`. **WebSocket** at `ws://127.0.0.1:8000/ws` speaks the same vocabulary:
+The API exposes the same capabilities as the MCP tools (85 endpoints); browse them all at `/docs`. **WebSocket** at `ws://127.0.0.1:8000/ws` speaks the same vocabulary:
 
 ```python
 await ws.send(json.dumps({"action": "navigate", "params": {"url": "https://example.com"}}))
@@ -282,6 +325,7 @@ All settings come from `ABC_*` environment variables; see [.env.example](.env.ex
 | `ABC_DISCOVERY_MODE` | `LEARN` | Website skills: `OFF` \| `READ_ONLY` \| `LEARN` |
 | `ABC_AI_PROVIDER` / `ABC_AI_MODEL` | `claude` / `claude-opus-4-8` | Model for `verify_goal`, `find_element`, `plan_actions` |
 | `ABC_RECORDING_FPS` / `ABC_FFMPEG` | `24` / `ffmpeg` | Recording settings |
+| `ABC_INIT_SCRIPT` | — | Path to a JS file injected into every page (e.g. an overlay for tutorial videos) |
 | `ABC_HOST` / `ABC_PORT` | `127.0.0.1` / `8000` | API bind address |
 | `ABC_LOG_LEVEL` | `INFO` | `DEBUG` … `CRITICAL` |
 
@@ -290,7 +334,7 @@ All settings come from `ABC_*` environment variables; see [.env.example](.env.ex
 ```text
    ┌──────────────┐  ┌──────────────────────┐  ┌──────────────────────────────┐
    │  MCP (stdio) │  │ FastAPI · /ws · SSE  │  │ Gemini / Claude / OpenAI     │
-   │  87 tools    │  │ Studio web UI        │  │ adapters (start.py agent)    │
+   │  91 tools    │  │ Studio web UI        │  │ adapters (start.py agent)    │
    └──────┬───────┘  └──────────┬───────────┘  └──────────────┬───────────────┘
           └─────────────────────┼─────────────────────────────┘
                                 ▼
@@ -327,7 +371,17 @@ Internal Python uses **camelCase**. MCP tool names and JSON keys use **snake_cas
 pytest
 ```
 
-The suite currently has 107 passing tests. Tests that need a browser skip automatically when Chromium is unavailable, and OCR tests skip without Tesseract.
+The suite currently has 108 passing tests. Tests that need a browser skip automatically when Chromium is unavailable, and OCR tests skip without Tesseract.
+
+## 🩺 Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| Claude Code shows `ai-browser … Connection closed` on **Windows** | The bundled [`.mcp.json`](.mcp.json) uses the macOS/Linux path `.venv/bin/python`. Register a local override instead: `claude mcp add ai-browser --scope local -- .venv\Scripts\python.exe start.py mcp`. Then reconnect with `/mcp`. |
+| New tools don't show up | MCP tool lists load when the server starts. Reconnect with `/mcp` or start a new session. |
+| `Executable doesn't exist` / browser won't launch | Run `playwright install chromium`, or set `ABC_BROWSER_CHANNEL=chrome` to use your installed Chrome. |
+| Recording comes back as `.webm`, not `.mp4` | ffmpeg isn't on `PATH`. Install it or set `ABC_FFMPEG` to its full path. |
+| A site still detects automation | Use `ABC_BROWSER_CHANNEL=chrome`, keep `ABC_HUMANIZE=true`, and log in once by hand with `login_session`. |
 
 ## 💡 Why I built it
 
@@ -337,6 +391,7 @@ AI agents are only useful when they can interact with real systems. Claude Eyes 
 
 - [ ] True concurrent execution across pooled sessions (not just tabs)
 - [ ] Human approval between sensitive actions
+- [x] Live JS/CSS injection and tutorial overlays for recordings
 - [ ] Console log capture
 - [ ] Remote / distributed browser execution
 

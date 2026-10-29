@@ -142,6 +142,8 @@ class Settings:
         # ----- Recording defaults ------------------------------------------
         self.recordingFps: int = _envInt("ABC_RECORDING_FPS", 24)
         self.ffmpegBinary: str = os.getenv("ABC_FFMPEG", "ffmpeg")
+        # Optional JS file injected into every page (e.g. a tutorial cursor overlay).
+        self.initScript: str = os.getenv("ABC_INIT_SCRIPT", "")
 
         # ----- API server defaults -----------------------------------------
         self.apiHost: str = os.getenv("ABC_HOST", "127.0.0.1")

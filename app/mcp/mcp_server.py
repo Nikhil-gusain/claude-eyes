@@ -46,6 +46,11 @@ mcp = FastMCP(
         "reloads on start (URL is preserved), and the video is only flushed on stop. "
         "`stop_recording` returns {video_path, duration, resolution, fps} \u2014 MP4 when ffmpeg "
         "is available, otherwise a playable WebM.\n"
+        "- Overlays for tutorial videos: `run_js` (evaluate JS on the page), `add_css` (inject "
+        "styles into the current page) and `add_init_js` (script re-run on every page load, kept "
+        "across the recording relaunch) can draw captions, arrows, spotlights, zoom and toasts; "
+        "they show up in `start_recording` videos. Playwright video has no mouse cursor, so "
+        "draw an overlay to show where a click happens.\n"
         "- The profile is persistent: logins survive restarts. Use "
         "`set_headless(headless=false)` when a human must act (captcha, first login).\n"
         "- `clear_storage` deletes saved screenshots/recordings/downloads on demand."
@@ -501,6 +506,61 @@ async def hover(selector: str, timeoutMs: int | None = None, tab: TabArg = None)
             server default.
     """
     return await getBrowserManager().hover(selector, timeoutMs=timeoutMs)
+
+
+@mcp.tool(name="run_js")
+@safeAsync(action="run_js")
+async def runJs(script: str, arg: Any = None, tab: TabArg = None) -> dict[str, Any]:
+    """Run JavaScript on the page and return its (JSON-safe) result.
+
+    Returns ``{"ok": true, "result": ...}``; a JS exception returns
+    ``{"ok": false, "error": ...}`` instead of failing. Results over 20k chars
+    come back as a truncated JSON string with ``"truncated": true``.
+
+    Args:
+        script: A function source (``"(a) => a * 2"``, called with ``arg``) or a
+            bare expression (``"document.title"``). Promises are awaited.
+        arg: Optional JSON-serialisable value passed to the function.
+    """
+    return await getBrowserManager().runJs(script, arg)
+
+
+@mcp.tool(name="add_css")
+@safeAsync(action="add_css")
+async def addCss(css: str, tab: TabArg = None) -> dict[str, Any]:
+    """Inject a ``<style>`` tag into the current page only (gone after navigation;
+    use ``add_init_js`` for styles that should persist).
+
+    Args:
+        css: Stylesheet text.
+    """
+    return await getBrowserManager().addCss(css)
+
+
+@mcp.tool(name="add_init_js")
+@safeAsync(action="add_init_js")
+async def addInitJs(script: str, name: str | None = None) -> dict[str, Any]:
+    """Register a script that runs before page scripts on every future page load,
+    in every tab (not the page already open — use ``run_js`` for that).
+
+    Scripts survive ``start_recording`` / ``stop_recording`` context relaunches.
+
+    Args:
+        script: JavaScript source to run on each load.
+        name: Optional key; a later call with the same name replaces this script
+            from the next context launch on (the old one keeps running in the
+            current context, so make overlay scripts idempotent).
+    """
+    return await getBrowserManager().addInitJs(script, name=name)
+
+
+@mcp.tool(name="clear_init_js")
+@safeAsync(action="clear_init_js")
+async def clearInitJs() -> dict[str, Any]:
+    """Forget every ``add_init_js`` script. Takes effect from the next context
+    launch (e.g. ``start_recording``/``stop_recording``, ``set_headless``, reopening
+    the browser); scripts already added keep running in the current context."""
+    return await getBrowserManager().clearInitJs()
 
 
 @mcp.tool(name="click")

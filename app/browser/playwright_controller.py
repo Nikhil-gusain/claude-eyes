@@ -13,6 +13,7 @@ multi-session support will later plug in.
 
 from __future__ import annotations
 
+import json
 import re
 import shutil
 import uuid
@@ -255,6 +256,9 @@ class PlaywrightController:
         self.userDataDir: Path = settings.userDataDir
         # Name of the active named profile backing ``userDataDir`` (if any).
         self.profileName: Optional[str] = None
+        # Scripts from add_init_js (key -> source, in registration order). Kept
+        # here because recording relaunches the context, which drops init scripts.
+        self.initScripts: dict[str, str] = {}
 
         # Last known mouse position, so human-like moves curve from where the
         # cursor actually was rather than always starting at the origin.
@@ -410,6 +414,9 @@ class PlaywrightController:
         if settings.stealth and self.browserType == "chromium":
             contextArgs["args"] = stealth.launchArgs()
             contextArgs["ignore_default_args"] = stealth.ignoreDefaultArgs()
+            # Playwright adds --no-sandbox unless the sandbox is on; that flag shows a
+            # warning bar and is an unusual-config fingerprint.
+            contextArgs["chromium_sandbox"] = True
         if self.recordVideoDir is not None:
             contextArgs["record_video_dir"] = str(self.recordVideoDir)
             contextArgs["record_video_size"] = {
@@ -430,6 +437,13 @@ class PlaywrightController:
                 await self._context.add_init_script(stealth.STEALTH_INIT_JS)
             except Exception as exc:  # noqa: BLE001 - stealth is best-effort
                 logger.debug("Failed to install stealth init script: %s", exc)
+        if settings.initScript:
+            try:
+                await self._context.add_init_script(path=settings.initScript)
+            except Exception as exc:  # noqa: BLE001 - overlay is best-effort
+                logger.warning("Failed to install ABC_INIT_SCRIPT %s: %s", settings.initScript, exc)
+        for script in self.initScripts.values():
+            await self._context.add_init_script(script=script)
 
         # Capture network activity for the whole context (all tabs).
         self._context.on("response", self._onResponse)
@@ -813,6 +827,48 @@ class PlaywrightController:
     async def hoverElement(self, selector: str, timeoutMs: int | None = None) -> dict[str, Any]:
         await self.activePage.hover(selector, timeout=timeoutMs or settings.defaultTimeoutMs)
         return {"hovered": selector}
+
+    # ------------------------------------------------------------------ #
+    # Live JS/CSS injection (e.g. tutorial overlays while recording)
+    # ------------------------------------------------------------------ #
+    async def runJs(self, script: str, arg: Any = None, maxChars: int = 20_000) -> dict[str, Any]:
+        """Evaluate *script* (function source or bare expression) on the target tab.
+
+        A JS exception comes back as ``{"ok": False, "error": ...}`` instead of
+        raising. Results are made JSON-safe and truncated past *maxChars*.
+        """
+        page = self.activePage
+        try:
+            result = await page.evaluate(script, arg)
+        except Exception as exc:  # noqa: BLE001 - a page-side error is data, not a tool failure
+            return {"ok": False, "error": getattr(exc, "message", None) or str(exc)}
+        text = json.dumps(result, default=str)
+        if len(text) > maxChars:
+            return {"ok": True, "result": text[:maxChars], "truncated": True}
+        return {"ok": True, "result": json.loads(text)}
+
+    async def addCss(self, css: str) -> dict[str, Any]:
+        """Add a ``<style>`` tag to the current page (lost on navigation)."""
+        await self.activePage.add_style_tag(content=css)
+        return {"ok": True}
+
+    async def addInitJs(self, script: str, name: str | None = None) -> dict[str, Any]:
+        """Register *script* to run on every future page load in every tab.
+
+        Re-applied on each context launch. Re-using *name* replaces the stored
+        script, but the old one keeps running in the live context until the next
+        launch (Playwright can't remove init scripts portably).
+        """
+        self.initScripts[name or uuid.uuid4().hex] = script
+        if self._context is not None:
+            await self._context.add_init_script(script=script)
+        return {"ok": True, "name": name, "count": len(self.initScripts)}
+
+    async def clearInitJs(self) -> dict[str, Any]:
+        """Forget all add_init_js scripts; takes effect from the next context launch."""
+        cleared = len(self.initScripts)
+        self.initScripts.clear()
+        return {"ok": True, "cleared": cleared}
 
     async def clickElement(
         self,

@@ -426,6 +426,19 @@ class BrowserManager:
             recordParams={"selector": selector, "timeoutMs": timeoutMs},
         )
 
+    async def runJs(self, script: str, arg: Any = None, tab: str | None = None) -> dict[str, Any]:
+        return await self._run("run_js", self._guard(lambda: self.controller.runJs(script, arg)), tab=tab)
+
+    async def addCss(self, css: str, tab: str | None = None) -> dict[str, Any]:
+        return await self._run("add_css", self._guard(lambda: self.controller.addCss(css)), tab=tab)
+
+    async def addInitJs(self, script: str, name: str | None = None) -> dict[str, Any]:
+        # No running-browser guard: scripts registered early apply at launch.
+        return await self._run("add_init_js", lambda: self.controller.addInitJs(script, name))
+
+    async def clearInitJs(self) -> dict[str, Any]:
+        return await self._run("clear_init_js", self.controller.clearInitJs)
+
     async def click(self, selector: str, button: str = "left", clickCount: int = 1, timeoutMs: int | None = None, humanize: bool | None = None, tab: str | None = None) -> dict[str, Any]:
         return await self._run(
             "click",

@@ -7,7 +7,7 @@ match project convention; Pydantic still serialises them verbatim.
 
 from __future__ import annotations
 
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -106,6 +106,22 @@ class FillCommand(BaseModel):
 class HoverCommand(BaseModel):
     selector: str
     timeoutMs: Optional[int] = Field(default=None, ge=0, le=300_000)
+
+
+class RunJsCommand(BaseModel):
+    script: str
+    arg: Any = None
+    tab: Optional[str] = None
+
+
+class AddCssCommand(BaseModel):
+    css: str
+    tab: Optional[str] = None
+
+
+class AddInitJsCommand(BaseModel):
+    script: str
+    name: Optional[str] = None
 
 
 class SelectCommand(BaseModel):
